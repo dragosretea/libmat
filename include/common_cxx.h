@@ -301,6 +301,7 @@ inline std::string get_other_file_path(std::string filePath, int type,
       break;
   }
   assert(false);
+  return {};  // unreachable, silences warning
 }
 
 template <typename T>

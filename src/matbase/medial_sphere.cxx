@@ -255,6 +255,7 @@ bool TangentConcaveLine::update_covered_sf_fids(const SurfaceMesh& sf_mesh,
     sf_mesh.collect_kring_neighbors_given_fid(k, adj_fid,
                                               this->sf_fids_covered_two[i]);
   }
+  return true;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////
