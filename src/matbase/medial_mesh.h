@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+
 #include "common_geogram.h"
 #include "medial_primitives.h"
 #include "medial_sphere.h"
@@ -170,7 +172,7 @@ class MedialMesh {
   // given two sorted MedialFace:id indices (mfid_min, mfid_max),
   // we can get the index for the matrix by calling get_upper_tri_matrix_idx()
   // updated by RPD3D_Wrapper::cluster_mface_adj_type()
-  std::vector<int> is_two_faces_on_the_same_sheet;
+  std::unordered_map<int, int> is_two_faces_on_the_same_sheet;
 
   int numSpheres_active;
   int numEdges_active;
