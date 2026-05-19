@@ -1,4 +1,5 @@
 #include <cub/cub.cuh>
+#include <cuda/functional>
 
 #include "dist2mat.h"
 
@@ -261,7 +262,7 @@ __global__ void ClosestDistanceToLocalMat(const float3* samples,
   __syncthreads();
 
   const float reduced =
-      BlockReduce(tmp_storage).Reduce(local_closest_dist, cub::Min());
+      BlockReduce(tmp_storage).Reduce(local_closest_dist, ::cuda::minimum<>{});
 
   if (tid == 0) {
     // printf("gid: %d, blockid %d\n", gid, blockid);
