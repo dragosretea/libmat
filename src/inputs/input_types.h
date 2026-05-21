@@ -110,6 +110,7 @@ class FeatureLine {
 
 class TetMesh {
  public:
+  TetMesh() = default;
   TetMesh(std::string path) : tet_path_with_ext(path) {};
   inline int get_fl_id(const int fe_id) const {
     assert(fe_id >= 0 && fe_id < feature_edges.size());
