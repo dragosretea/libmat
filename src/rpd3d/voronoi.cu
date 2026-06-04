@@ -452,6 +452,78 @@ void copy_cc(const ConvexCellTransfer& cc, ConvexCellHost& cc_trans) {
  * vertices: tet vertices
  * indices: tet 4 indices of vertices [can be parital indices]
  */
+namespace {
+// ---------------------------------------------------------------------------
+// Persistent device-buffer cache for compute_clipped_voro_diagram_GPU().
+//
+// The function runs O(100x) per pipeline run with a FIXED tet mesh; only the
+// sphere/site data changes. Fresh cudaMalloc/cudaFree of ~30 buffers every call
+// dominated wall time (~1.3 s/call overhead vs ~60 ms of actual GPU compute --
+// measured). We keep the buffers alive and grow-only across calls instead.
+//
+// Reuse is semantically identical to fresh allocation: cudaMalloc never zeroes
+// memory, so a sufficiently large reused buffer behaves like a new one, and
+// every explicit cudaMemset in the function is preserved. For pitched buffers
+// we reuse the original pitch (valid while logical width/height stay within the
+// allocated capacity).
+//
+// Assumes serial invocation (compute_rpd() is called serially); the cache is
+// process-global and not thread-safe.
+// ---------------------------------------------------------------------------
+struct VoroDevCache {
+  struct Buf {
+    void* p = nullptr;
+    size_t cap = 0;  // bytes
+  };
+  struct PitchBuf {
+    void* p = nullptr;
+    size_t cap_w = 0;  // allocated row width in bytes
+    size_t cap_h = 0;  // allocated rows
+    size_t pitch = 0;  // bytes
+  };
+
+  void* ensure(Buf& b, size_t need_bytes) {
+    if (need_bytes > b.cap) {
+      if (b.p) cudaFree(b.p);
+      cudaMalloc(&b.p, need_bytes);
+      cuda_check_error();
+      b.cap = need_bytes;
+    }
+    return b.p;
+  }
+  // returns pitch in bytes; device pointer is b.p
+  size_t ensure_pitch(PitchBuf& b, size_t width_bytes, size_t rows) {
+    if (!b.p || width_bytes > b.cap_w || rows > b.cap_h) {
+      if (b.p) cudaFree(b.p);
+      size_t w = width_bytes > b.cap_w ? width_bytes : b.cap_w;
+      size_t h = rows > b.cap_h ? rows : b.cap_h;
+      cudaMallocPitch(&b.p, &b.pitch, w, h);
+      cuda_check_error();
+      b.cap_w = w;
+      b.cap_h = h;
+    }
+    return b.pitch;
+  }
+
+  // static tet mesh (uploaded once; rebuilt only if mesh dimensions change)
+  int cached_n_vert = -1;
+  int cached_n_tet = -1;
+  float* vert_dev = nullptr;
+  int* idx_dev = nullptr;
+  size_t vert_pitch = 0, idx_pitch = 0;  // in elements
+  int* v_adjs_dev = nullptr;
+  int* e_adjs_dev = nullptr;
+  int* f_adjs_dev = nullptr;
+  int* f_ids_dev = nullptr;
+
+  // per-call work buffers (grow-only)
+  Buf voronoi_cells, cell_vol, site_weights, site_flags, convex_cells,
+      cell_bary_sum_lin;
+  PitchBuf cell_bary_sum, site_transposed, site_knn, tet_knn;
+};
+VoroDevCache g_voro;
+}  // namespace
+
 std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     const int num_itr_global, const std::vector<float>& vertices,
     const std::vector<int>& indices, const std::map<int, std::set<int>>& v2tets,
@@ -466,58 +538,67 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   int n_vert = vertices.size() / 3;
   int n_tet = (indices.size() >> 2);
 
-  // copy tet vertices and indices to device
-  float* vert_dev = nullptr;
-  int* idx_dev = nullptr;
-  size_t vert_pitch, idx_pitch;
-  copy_tet_data(vertices, indices, vert_dev, vert_pitch, idx_dev, idx_pitch);
-
-  // load adjacencies for Euler
-  int* v_adjs_dev = nullptr;
-  int* e_adjs_dev = nullptr;
-  int* f_adjs_dev = nullptr;
-  int* f_ids_dev = nullptr;
-  load_num_adjacent_cells_and_ids(v_adjs, e_adjs, f_adjs, f_ids, v_adjs_dev,
-                                  e_adjs_dev, f_adjs_dev, f_ids_dev);
+  // The tet mesh is static across calls -- upload it once and reuse. Rebuild
+  // only if the mesh dimensions change (e.g. a different model in-process).
+  if (g_voro.cached_n_vert != n_vert || g_voro.cached_n_tet != n_tet) {
+    if (g_voro.vert_dev) cudaFree(g_voro.vert_dev);
+    if (g_voro.idx_dev) cudaFree(g_voro.idx_dev);
+    if (g_voro.v_adjs_dev) cudaFree(g_voro.v_adjs_dev);
+    if (g_voro.e_adjs_dev) cudaFree(g_voro.e_adjs_dev);
+    if (g_voro.f_adjs_dev) cudaFree(g_voro.f_adjs_dev);
+    if (g_voro.f_ids_dev) cudaFree(g_voro.f_ids_dev);
+    copy_tet_data(vertices, indices, g_voro.vert_dev, g_voro.vert_pitch,
+                  g_voro.idx_dev, g_voro.idx_pitch);
+    load_num_adjacent_cells_and_ids(v_adjs, e_adjs, f_adjs, f_ids,
+                                    g_voro.v_adjs_dev, g_voro.e_adjs_dev,
+                                    g_voro.f_adjs_dev, g_voro.f_ids_dev);
+    g_voro.cached_n_vert = n_vert;
+    g_voro.cached_n_tet = n_tet;
+  }
+  float* vert_dev = g_voro.vert_dev;
+  int* idx_dev = g_voro.idx_dev;
+  size_t vert_pitch = g_voro.vert_pitch, idx_pitch = g_voro.idx_pitch;
+  int* v_adjs_dev = g_voro.v_adjs_dev;
+  int* e_adjs_dev = g_voro.e_adjs_dev;
+  int* f_adjs_dev = g_voro.f_adjs_dev;
+  int* f_ids_dev = g_voro.f_ids_dev;
   assert(v_adjs.size() == n_vert);
 
   // allocate memory for voronoi cell
-  VoronoiCell* voronoi_cells_dev = nullptr;
-  cudaMalloc((void**)&voronoi_cells_dev, n_site * sizeof(VoronoiCell));
-  cuda_check_error();
+  VoronoiCell* voronoi_cells_dev = (VoronoiCell*)g_voro.ensure(
+      g_voro.voronoi_cells, n_site * sizeof(VoronoiCell));
 
   // allocate memory forninwang:   output points
   float* cell_bary_sum_dev = nullptr;
   size_t cell_bary_sum_pitch_in_bytes = 0, cell_bary_sum_pitch = 0;
   if (site_is_transposed) {
-    cudaMallocPitch((void**)&cell_bary_sum_dev, &cell_bary_sum_pitch_in_bytes,
-                    n_site * sizeof(float), 3);
+    cell_bary_sum_pitch_in_bytes =
+        g_voro.ensure_pitch(g_voro.cell_bary_sum, n_site * sizeof(float), 3);
+    cell_bary_sum_dev = (float*)g_voro.cell_bary_sum.p;
     cell_bary_sum_pitch = cell_bary_sum_pitch_in_bytes / sizeof(float);
-  } else
-    cudaMalloc((void**)&cell_bary_sum_dev, 3 * n_site * sizeof(float));
-  cuda_check_error();
+  } else {
+    cell_bary_sum_dev = (float*)g_voro.ensure(g_voro.cell_bary_sum_lin,
+                                              3 * n_site * sizeof(float));
+  }
 
   // allocate memory for cell volume
   site_cell_vol.clear();
   site_cell_vol.resize(n_site);
-  float* cell_vol_dev = nullptr;
-  cudaMalloc((void**)&cell_vol_dev, n_site * sizeof(float));
-  cuda_check_error();
+  float* cell_vol_dev =
+      (float*)g_voro.ensure(g_voro.cell_vol, n_site * sizeof(float));
 
   // ninwang: allocate memory for site weights
   assert(site_weights.size() == n_site);
-  float* site_weights_dev = nullptr;
-  cudaMalloc((void**)&site_weights_dev, n_site * sizeof(float));
-  cuda_check_error();
+  float* site_weights_dev =
+      (float*)g_voro.ensure(g_voro.site_weights, n_site * sizeof(float));
   cudaMemcpy(site_weights_dev, site_weights.data(), n_site * sizeof(float),
              cudaMemcpyHostToDevice);
   cuda_check_error();
 
   // ninwang: allocate memory for site flag
   assert(site_flags.size() == n_site);
-  uint* site_flags_dev = nullptr;
-  cudaMalloc((void**)&site_flags_dev, n_site * sizeof(uint));
-  cuda_check_error();
+  uint* site_flags_dev =
+      (uint*)g_voro.ensure(g_voro.site_flags, n_site * sizeof(uint));
   cudaMemcpy(site_flags_dev, site_flags.data(), n_site * sizeof(uint),
              cudaMemcpyHostToDevice);
   cuda_check_error();
@@ -532,12 +613,13 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   //////////////////////////////
   // Load Site and Site Neighbors
   {
-    // allocate memory for site and site knn
-    cudaMallocPitch((void**)&site_transposed_dev, &site_pitch_in_bytes,
-                    n_site * sizeof(float), 3);
-    cudaMallocPitch((void**)&site_knn_dev, &site_knn_pitch_in_bytes,
-                    n_site * sizeof(int), site_k + 1);
-    cuda_check_error();
+    // reuse persistent site buffers (grow-only)
+    site_pitch_in_bytes =
+        g_voro.ensure_pitch(g_voro.site_transposed, n_site * sizeof(float), 3);
+    site_transposed_dev = (float*)g_voro.site_transposed.p;
+    site_knn_pitch_in_bytes =
+        g_voro.ensure_pitch(g_voro.site_knn, n_site * sizeof(int), site_k + 1);
+    site_knn_dev = (int*)g_voro.site_knn.p;
 
     site_pitch = site_pitch_in_bytes / sizeof(float);
     site_knn_pitch = site_knn_pitch_in_bytes / sizeof(int);
@@ -592,10 +674,10 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
         site_transposed_dev, site_flags_dev, n_site, site_pitch,
         site_weights_dev, site_knn_dev, site_k, site_knn_pitch, tet_knn, tet_k);
 
-    // allocate memory for tet knn (2D array)
-    cudaMallocPitch((void**)&tet_knn_dev, &tet_knn_pitch_in_bytes,
-                    n_tet * sizeof(int), tet_k);
-    cuda_check_error();
+    // reuse persistent tet_knn buffer (grow-only)
+    tet_knn_pitch_in_bytes =
+        g_voro.ensure_pitch(g_voro.tet_knn, n_tet * sizeof(int), tet_k);
+    tet_knn_dev = (int*)g_voro.tet_knn.p;
     tet_knn_pitch = tet_knn_pitch_in_bytes / sizeof(int);
     // copy tet_knn to device
     cudaMemcpy2D(tet_knn_dev, tet_knn_pitch_in_bytes, tet_knn.data(),
@@ -659,10 +741,9 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   // by function vcompute_tet_sphere_relation()
   // ninwang: allocate memory for all convex cells
   std::vector<ConvexCellTransfer> convex_cells_host(n_grids * n_blocks);
-  ConvexCellTransfer* convex_cells_dev = nullptr;
-  cudaMalloc((void**)&convex_cells_dev,
-             n_grids * n_blocks * sizeof(ConvexCellTransfer));
-  cuda_check_error();
+  ConvexCellTransfer* convex_cells_dev = (ConvexCellTransfer*)g_voro.ensure(
+      g_voro.convex_cells,
+      (size_t)n_grids * n_blocks * sizeof(ConvexCellTransfer));
 
   // allocate memory for stats
   std::vector<Status> stat(n_tet * tet_k, security_radius_not_reached);
@@ -774,20 +855,9 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
 
   record << std::endl;
 
-  cudaFree(vert_dev);
-  cudaFree(idx_dev);
-  cudaFree(v_adjs_dev);
-  cudaFree(e_adjs_dev);
-  cudaFree(f_adjs_dev);
-  cudaFree(f_ids_dev);
-  cudaFree(tet_knn_dev);
-  cudaFree(cell_vol_dev);
-  cudaFree(voronoi_cells_dev);
-  cudaFree(convex_cells_dev);
-  cudaFree(cell_bary_sum_dev);
-  cudaFree(site_transposed_dev);
-  cudaFree(site_knn_dev);
-  cudaFree(site_weights_dev);
+  // Device buffers above are persistent (see VoroDevCache) and intentionally
+  // not freed here -- they are reused across calls. gpu_stat frees itself via
+  // its GPUBuffer destructor.
 
   record.close();
 
