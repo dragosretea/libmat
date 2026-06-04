@@ -633,8 +633,6 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
                  cudaMemcpyHostToDevice);
     cuda_check_error();
 
-    printf("done copy site to device \n");
-
     // copy site_knn to device, init site_knn as -1
     // site_knn is 2d flat matrix
     // dim: (site_k+1) x n_site
@@ -643,8 +641,6 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
                  n_site * sizeof(int), n_site * sizeof(int), site_k + 1,
                  cudaMemcpyHostToDevice);
     cuda_check_error();
-
-    printf("done copy site_knn to device \n");
 
   }  // Site and Site Neighbors
 
@@ -662,7 +658,6 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
 
   //////////////////////////////
   // Tet-Sphere
-  cudaStreamSynchronize(0);  // for printf in device code
   int tet_k = -1;
   std::vector<int> tet_knn;  // init as -1
   int* tet_knn_dev = nullptr;
@@ -732,10 +727,6 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   // Note: will be updated later by tet_k
   int n_grids = n_tet * tet_k / VORO_BLOCK_SIZE + 1;
   int n_blocks = VORO_BLOCK_SIZE;
-  printf("n_vert: %d, n_tet: %d, n_site: %d, tet_k: %d, site_k: %d\n", n_vert,
-         n_tet, n_site, tet_k, site_k);
-  printf("n_grids: %d, n_blocks: %d, #threads: %d \n", n_grids, n_blocks,
-         n_grids * n_blocks);
 
   // allocate more, after tet_k been updated
   // by function vcompute_tet_sphere_relation()
@@ -757,13 +748,8 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
 
     cuda_check_error();
 
-    printf("calling clipped_voro_cell_test_GPU_param_tet \n");
-    printf("n_grids: %d, n_blocks: %d, #threads: %d \n", n_grids, n_blocks,
-           n_grids * n_blocks);
-
     // clip tet-cell (init as tet)
     // "voronoi_cells_dev" is not used
-    cudaStreamSynchronize(0);  // for printf in device code
     clipped_voro_cell_test_GPU_param_tet<<<n_grids, n_blocks>>>(
         site_transposed_dev, n_site, site_pitch, site_weights_dev,
         site_flags_dev, site_knn_dev, site_knn_pitch, site_k, vert_dev, n_vert,
@@ -773,7 +759,6 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
         cell_bary_sum_dev, cell_bary_sum_pitch, cell_vol_dev);
     cuda_check_error();
 
-    cudaStreamSynchronize(0);  // for printf in device code
     cudaEventRecord(stop);
     cudaEventSynchronize(start);
     cudaEventSynchronize(stop);
@@ -820,7 +805,6 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   //
   // stores non-duplicated convex_cells_host
   // seed -> tet_ids, do not process duplicates
-  printf("collecting convex_cells_host_non_dup ... \n");
   start_time = sw.now();
   std::vector<ConvexCellHost> convex_cells_host_non_dup;
   std::map<int, std::set<int>> tets2seed;  // mostly orderd by tet_ids
@@ -850,8 +834,6 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   }
   stop_time = sw.now();  // Non_Dup_RPCs
   record << stop_time - start_time << ", ";
-  printf("saved %zu/%zu unduplicated convex cells \n",
-         convex_cells_host_non_dup.size(), convex_cells_host.size());
 
   record << std::endl;
 
