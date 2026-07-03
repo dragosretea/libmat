@@ -609,6 +609,19 @@ void update_power_cells(const SurfaceMesh& sf_mesh,
     msphere.topo_clear();
   }
 
+  // The reload_active/reload_pc_explicit explicitation dominated this loop and
+  // is per-cell independent (pure function of the cell's own clip data) -- run
+  // it in parallel first; the remaining serial pass only does the cheap
+  // per-sphere set inserts. Same per-cell values, same set contents =>
+  // bit-identical.
+  // some clipping planes may not exist in tri but
+  // we still store it, here is to filter those planes
+  GEO::parallel_for(0, convex_cells_host.size(), [&](GEO::index_t i) {
+    auto& convex_cell = convex_cells_host.at(i);
+    if (!convex_cell.is_active_updated) convex_cell.reload_active();
+    if (!convex_cell.is_pc_explicit) convex_cell.reload_pc_explicit();
+  });
+
   // seed_id -> {id of convex_cells_host}
   for (uint i = 0; i < convex_cells_host.size(); i++) {
     auto& convex_cell = convex_cells_host.at(i);
@@ -617,16 +630,6 @@ void update_power_cells(const SurfaceMesh& sf_mesh,
     auto& msphere = all_medial_spheres.at(convex_cell.voro_id);
     msphere.pcell.cell_ids.insert(cell_id);
     msphere.pcell.tet_ids.insert(convex_cell.tet_id);
-
-    // if (convex_cell.voro_id == 925 && convex_cell.tet_id == 4226) {
-    //   printf("++++++ voro_id %d and tet_id %d has cell %d\n",
-    //          convex_cell.voro_id, convex_cell.tet_id, convex_cell.id);
-    // }
-
-    // some clipping planes may not exist in tri but
-    // we still store it, here is to filter those planes
-    if (!convex_cell.is_active_updated) convex_cell.reload_active();
-    if (!convex_cell.is_pc_explicit) convex_cell.reload_pc_explicit();
   }
 
   // update
