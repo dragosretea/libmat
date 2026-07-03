@@ -49,6 +49,11 @@ struct GPUBuffer {
   int size;
 };
 
+// Free every persistent device buffer held by the RPD cache (tet mesh upload,
+// per-call work buffers). Safe to call between pipeline stages; the next
+// compute_clipped_voro_diagram_GPU() re-allocates and re-uploads on demand.
+void cleanup_voronoi_gpu_cache();
+
 std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     const int num_itr_global, const std::vector<float>& vertices,
     const std::vector<int>& indices, const std::map<int, std::set<int>>& v2tets,

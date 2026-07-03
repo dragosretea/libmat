@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <unordered_set>
 
 #include "convex_cell.h"
 #include "kNN-CUDA/knncuda.h"
@@ -192,6 +193,63 @@ __global__ void tet_sphere_relations_dev(
   }  // for n_site
 }
 
+// Device-side helpers for compute_tet_sphere_relation: the tet_knn matrix is
+// built directly on the GPU (ascending sid per tet = same order as the old
+// host loop, so the resulting device matrix is bit-identical). This removes a
+// #site x #tet D2H copy and a single-threaded O(#site * #tet) host loop per
+// RPD call.
+__global__ void count_tet_related_spheres(const int* rel,
+                                          const size_t rel_pitch,
+                                          const int n_tet, const int n_site,
+                                          int* counts) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= n_tet) return;
+  int c = 0;
+  for (int sid = 0; sid < n_site; ++sid)
+    if (rel[sid * rel_pitch + tid] == 1) ++c;
+  counts[tid] = c;
+}
+
+__global__ void fill_tet_knn_dev(const int* rel, const size_t rel_pitch,
+                                 const int n_tet, const int n_site,
+                                 const int tet_k, const size_t tet_knn_pitch,
+                                 int* tet_knn) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= n_tet) return;
+  int k = 0;
+  for (int sid = 0; sid < n_site; ++sid)
+    if (rel[sid * rel_pitch + tid] == 1) {
+      tet_knn[(size_t)k * tet_knn_pitch + tid] = sid;
+      ++k;
+    }
+  for (; k < tet_k; ++k) tet_knn[(size_t)k * tet_knn_pitch + tid] = -1;
+}
+
+// Stable stream compaction of the per-(tet,seed) convex-cell output: the old
+// path value-initialized a #slots-sized host vector (~GBs: sizeof
+// ConvexCellTransfer is ~2.7KB) and copied EVERY slot D2H, only for the host
+// to skip the invalid majority. Flag validity on device (same predicate as
+// is_convex_cell_valid), exclusive-scan the flags (tiny host scan), and gather
+// valid cells in slot order -- the host then sees the exact same valid cells
+// in the exact same order as before, so downstream dedup is bit-identical.
+__global__ void flag_valid_cells(const ConvexCellTransfer* cells, const int n,
+                                 int* flags) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const Status s = cells[i].status;
+  flags[i] =
+      (s == Status::success || s == Status::security_radius_not_reached) ? 1
+                                                                         : 0;
+}
+
+__global__ void gather_valid_cells(const ConvexCellTransfer* cells,
+                                   const int* flags, const int* pos,
+                                   const int n, ConvexCellTransfer* out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  if (flags[i]) out[pos[i]] = cells[i];
+}
+
 // ninwang
 // update tet_knn and tet_k
 // use power distance to find the potential relations between tet and sphere
@@ -201,7 +259,8 @@ void compute_tet_sphere_relation(
     const float* site_dev, const uint* site_flags_dev, const int n_site,
     const size_t site_pitch, const float* site_weights_dev,
     const int* site_knn_dev, const int site_k, const size_t site_knn_pitch,
-    std::vector<int>& tet_knn, int& tet_k) {
+    int*& tet_sphere_relate_dev_out, size_t& tet_sphere_relate_pitch_out,
+    int& tet_k) {
   // printf("calling compute_tet_sphere_relation... \n");
 
   assert(site_pitch > 0);  // always transposed
@@ -222,14 +281,8 @@ void compute_tet_sphere_relation(
                              vert_dev, n_vert, vert_pitch, 3, tet_pdist_dev,
                              tet_pdist_pitch);
 
-  // ninwang: debug
-  // copy knn back to host
-  cudaStreamSynchronize(0);
-  std::vector<float> tet_pdist(n_site * n_vert);
-  cudaMemcpy2D(tet_pdist.data(), n_vert * sizeof(float), tet_pdist_dev,
-               tet_pdist_pitch_in_bytes, n_vert * sizeof(float), n_site,
-               cudaMemcpyDeviceToHost);
-  cuda_check_error();
+  // (debug D2H copy of the full tet_pdist matrix removed -- it fed only
+  // commented-out prints and cost a ~15MB transfer per RPD call)
 
   // printf("tet_pdist matrix: \n\t");
   // for (uint vid = 0; vid < n_vert; vid++) {    // column
@@ -262,63 +315,31 @@ void compute_tet_sphere_relation(
       site_knn_pitch, site_k, tet_pdist_dev, tet_pdist_pitch,
       tet_sphere_relate_dev, tet_sphere_relate_pitch);
 
-  // copy tet_sphere_relate_dev back to CPU
-  cudaStreamSynchronize(0);
-  std::vector<int> tet_sphere(n_site * n_tet);
-  cudaMemcpy2D(tet_sphere.data(), n_tet * sizeof(int), tet_sphere_relate_dev,
-               tet_sphere_relate_pitch_in_bytes, n_tet * sizeof(int), n_site,
-               cudaMemcpyDeviceToHost);
+  // update tet_k = maximum number of related spheres per tet, computed on
+  // device: per-tet counts kernel + tiny (#tet ints) D2H + host max. The
+  // relation matrix itself stays on the GPU for fill_tet_knn_dev.
+  int* counts_dev = nullptr;
+  cudaMalloc((void**)&counts_dev, n_tet * sizeof(int));
   cuda_check_error();
-
-  // printf("tet_sphere matrix: \n\t");
-  // for (uint tid = 0; tid < n_tet; tid++) {  // column
-  //   // for (uint sid = 0; sid < n_site; sid++) {  // row
-  //   for (uint sid = 16; sid < 17; sid++) {  // row
-  //     printf("%d ", tet_sphere[tid + sid * n_tet]);
-  //   }
-  //   printf("\n\t ");
-  // }
-  // printf("\n");
-
-  // update tet_k = maximum number of related sphere per tet
+  count_tet_related_spheres<<<(n_tet + 255) / 256, 256>>>(
+      tet_sphere_relate_dev, tet_sphere_relate_pitch, n_tet, n_site,
+      counts_dev);
+  cuda_check_error();
+  std::vector<int> counts(n_tet);
+  cudaMemcpy(counts.data(), counts_dev, n_tet * sizeof(int),
+             cudaMemcpyDeviceToHost);
+  cuda_check_error();
+  cudaFree(counts_dev);
   tet_k = 0;
-  std::vector<std::vector<int>> tet_spheres_all(n_tet);
-  for (uint tid = 0; tid < n_tet; tid++) {
-    for (uint sid = 0; sid < n_site; sid++) {
-      if (tet_sphere[tid + sid * n_tet] == 1) {
-        tet_spheres_all[tid].push_back(sid);  // store related spheres
-      }
-    }
-    if (tet_spheres_all[tid].size() > tet_k) {
-      tet_k = tet_spheres_all[tid].size();
-
-      // printf("tet_id %d has %d neighbors: [", tid,
-      // tet_spheres_all[tid].size()); for (const auto& n :
-      // tet_spheres_all[tid]) {
-      //   printf("%d, ", n);
-      // }
-      // printf("]\n");
-    }
-  }
+  for (int tid = 0; tid < n_tet; tid++)
+    if (counts[tid] > tet_k) tet_k = counts[tid];
   printf("updated tet_k: %d\n", tet_k);
 
-  // convert to flat 2D matrix
-  // 1. size: (tet_k) x n_tet
-  // 2. each column j store all related sphere of tet j
-  // 3. init as -1
-  tet_knn.clear();
-  tet_knn.resize(tet_k * n_tet, -1);
-  for (int tid = 0; tid < n_tet; tid++) {
-    const auto& related_spheres = tet_spheres_all.at(tid);
-    for (int sid = 0; sid < related_spheres.size(); sid++) {
-      assert(sid <= tet_k);
-      tet_knn[tid + sid * n_tet] = related_spheres[sid];
-    }
-  }
-
-  // Memory clean-up
+  // Memory clean-up (the relation matrix is handed to the caller, which
+  // fills tet_knn on device and frees it)
   cudaFree(tet_pdist_dev);
-  cudaFree(tet_sphere_relate_dev);
+  tet_sphere_relate_dev_out = tet_sphere_relate_dev;
+  tet_sphere_relate_pitch_out = tet_sphere_relate_pitch;
 }
 
 void copy_tet_data(const std::vector<float>& vertices,
@@ -518,11 +539,56 @@ struct VoroDevCache {
 
   // per-call work buffers (grow-only)
   Buf voronoi_cells, cell_vol, site_weights, site_flags, convex_cells,
-      cell_bary_sum_lin;
+      cell_bary_sum_lin, cc_flags, cc_pos, cc_compact;
   PitchBuf cell_bary_sum, site_transposed, site_knn, tet_knn;
+
+  // Free every device buffer and reset to pristine state. A subsequent
+  // compute_clipped_voro_diagram_GPU() re-allocates on demand and re-uploads
+  // the tet mesh (cached_n_vert/tet reset forces the rebuild), so this is
+  // context-preserving.
+  void free_all() {
+    auto freeBuf = [](Buf& b) {
+      if (b.p) cudaFree(b.p);
+      b.p = nullptr;
+      b.cap = 0;
+    };
+    auto freePitch = [](PitchBuf& b) {
+      if (b.p) cudaFree(b.p);
+      b.p = nullptr;
+      b.cap_w = 0;
+      b.cap_h = 0;
+      b.pitch = 0;
+    };
+    if (vert_dev) cudaFree(vert_dev);
+    if (idx_dev) cudaFree(idx_dev);
+    if (v_adjs_dev) cudaFree(v_adjs_dev);
+    if (e_adjs_dev) cudaFree(e_adjs_dev);
+    if (f_adjs_dev) cudaFree(f_adjs_dev);
+    if (f_ids_dev) cudaFree(f_ids_dev);
+    vert_dev = nullptr;
+    idx_dev = nullptr;
+    v_adjs_dev = e_adjs_dev = f_adjs_dev = f_ids_dev = nullptr;
+    vert_pitch = idx_pitch = 0;
+    cached_n_vert = cached_n_tet = -1;
+    freeBuf(voronoi_cells);
+    freeBuf(cell_vol);
+    freeBuf(site_weights);
+    freeBuf(site_flags);
+    freeBuf(convex_cells);
+    freeBuf(cell_bary_sum_lin);
+    freeBuf(cc_flags);
+    freeBuf(cc_pos);
+    freeBuf(cc_compact);
+    freePitch(cell_bary_sum);
+    freePitch(site_transposed);
+    freePitch(site_knn);
+    freePitch(tet_knn);
+  }
 };
 VoroDevCache g_voro;
 }  // namespace
+
+void cleanup_voronoi_gpu_cache() { g_voro.free_all(); }
 
 std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     const int num_itr_global, const std::vector<float>& vertices,
@@ -645,8 +711,9 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   }  // Site and Site Neighbors
 
   //////////////////////////////
-  // Store records
-  std::ofstream record("record.csv", std::ios::app);
+  // Store records (stream kept open across calls -- this function runs
+  // hundreds of times per pipeline run)
+  static std::ofstream record("record.csv", std::ios::app);
   record << "n_site, n_tet, site_k, tet_k, Tet_Sphere, Compute_RPD, "
             "GPU2CPU, Non_Dup_RPCs\n";
   record << std::setprecision(5) << std::setiosflags(std::ios::fixed);
@@ -659,26 +726,30 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   //////////////////////////////
   // Tet-Sphere
   int tet_k = -1;
-  std::vector<int> tet_knn;  // init as -1
   int* tet_knn_dev = nullptr;
   size_t tet_knn_pitch, tet_knn_pitch_in_bytes;
   {
-    // update tet_knn and tet_k
+    // update tet_k on device; the relation matrix stays on the GPU
+    int* tet_sphere_relate_dev = nullptr;
+    size_t tet_sphere_relate_pitch = 0;
     compute_tet_sphere_relation(
         vert_dev, n_vert, vert_pitch, idx_dev, n_tet, idx_pitch,
         site_transposed_dev, site_flags_dev, n_site, site_pitch,
-        site_weights_dev, site_knn_dev, site_k, site_knn_pitch, tet_knn, tet_k);
+        site_weights_dev, site_knn_dev, site_k, site_knn_pitch,
+        tet_sphere_relate_dev, tet_sphere_relate_pitch, tet_k);
 
     // reuse persistent tet_knn buffer (grow-only)
     tet_knn_pitch_in_bytes =
         g_voro.ensure_pitch(g_voro.tet_knn, n_tet * sizeof(int), tet_k);
     tet_knn_dev = (int*)g_voro.tet_knn.p;
     tet_knn_pitch = tet_knn_pitch_in_bytes / sizeof(int);
-    // copy tet_knn to device
-    cudaMemcpy2D(tet_knn_dev, tet_knn_pitch_in_bytes, tet_knn.data(),
-                 n_tet * sizeof(int), n_tet * sizeof(int), tet_k,
-                 cudaMemcpyHostToDevice);
+    // fill tet_knn directly on device (ascending sid per tet = the exact
+    // content the old host loop + cudaMemcpy2D produced)
+    fill_tet_knn_dev<<<(n_tet + 255) / 256, 256>>>(
+        tet_sphere_relate_dev, tet_sphere_relate_pitch, n_tet, n_site, tet_k,
+        tet_knn_pitch, tet_knn_dev);
     cuda_check_error();
+    cudaFree(tet_sphere_relate_dev);
   }
   // // ninwang: debug
   // // copy knn back to host
@@ -730,8 +801,8 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
 
   // allocate more, after tet_k been updated
   // by function vcompute_tet_sphere_relation()
-  // ninwang: allocate memory for all convex cells
-  std::vector<ConvexCellTransfer> convex_cells_host(n_grids * n_blocks);
+  // ninwang: allocate memory for all convex cells (device only -- the host
+  // sees just the compacted valid cells, see below)
   ConvexCellTransfer* convex_cells_dev = (ConvexCellTransfer*)g_voro.ensure(
       g_voro.convex_cells,
       (size_t)n_grids * n_blocks * sizeof(ConvexCellTransfer));
@@ -773,31 +844,54 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   }  // GPU voro kernel only
 
   ////////////////////////////////////////////
-  // GPU2CPU: copy data back to the cpu
+  // GPU2CPU: copy data back to the cpu -- only the VALID convex cells.
+  // flag (device) -> exclusive scan (tiny host scan of #slot ints) -> ordered
+  // gather (device) -> single D2H of the compacted cells. Slot order is
+  // preserved, so the dedup loop below behaves exactly as it did when it
+  // scanned the full buffer.
+  int n_valid = 0;
+  static std::vector<ConvexCellTransfer> compact_host;  // persistent
   {
     start_time = sw.now();
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
+    const int n_slots = n_grids * n_blocks;
+    int* flags_dev =
+        (int*)g_voro.ensure(g_voro.cc_flags, (size_t)n_slots * sizeof(int));
+    int* pos_dev =
+        (int*)g_voro.ensure(g_voro.cc_pos, (size_t)n_slots * sizeof(int));
+    flag_valid_cells<<<(n_slots + 255) / 256, 256>>>(convex_cells_dev, n_slots,
+                                                     flags_dev);
+    cuda_check_error();
+    static std::vector<int> flags, pos;  // persistent scratch
+    flags.resize(n_slots);
+    pos.resize(n_slots);
+    cudaMemcpy(flags.data(), flags_dev, (size_t)n_slots * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    cuda_check_error();
+    int acc = 0;
+    for (int i = 0; i < n_slots; ++i) {
+      pos[i] = acc;
+      acc += flags[i];
+    }
+    n_valid = acc;
     cudaMemcpy2D(site.data(), n_site * sizeof(float), site_transposed_dev,
                  site_pitch_in_bytes, n_site * sizeof(float), 3,
                  cudaMemcpyDeviceToHost);
-
-    // ninwang: copy all concave cells
-    cudaMemcpy(convex_cells_host.data(), convex_cells_dev,
-               n_grids * n_blocks * sizeof(ConvexCellTransfer),
-               cudaMemcpyDeviceToHost);
-
-    cudaEventRecord(stop);
-    cudaEventSynchronize(start);
-    cudaEventSynchronize(stop);
-
+    if (n_valid > 0) {
+      cudaMemcpy(pos_dev, pos.data(), (size_t)n_slots * sizeof(int),
+                 cudaMemcpyHostToDevice);
+      ConvexCellTransfer* compact_dev = (ConvexCellTransfer*)g_voro.ensure(
+          g_voro.cc_compact, (size_t)n_valid * sizeof(ConvexCellTransfer));
+      gather_valid_cells<<<(n_slots + 255) / 256, 256>>>(
+          convex_cells_dev, flags_dev, pos_dev, n_slots, compact_dev);
+      cuda_check_error();
+      if (compact_host.size() < (size_t)n_valid) compact_host.resize(n_valid);
+      cudaMemcpy(compact_host.data(), compact_dev,
+                 (size_t)n_valid * sizeof(ConvexCellTransfer),
+                 cudaMemcpyDeviceToHost);
+      cuda_check_error();
+    }
     stop_time = sw.now();  // gpu2cpu
     record << stop_time - start_time << ", ";
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
   }  // copy data back to the cpu
 
   ////////////////////////////////////////////
@@ -807,26 +901,26 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   // seed -> tet_ids, do not process duplicates
   start_time = sw.now();
   std::vector<ConvexCellHost> convex_cells_host_non_dup;
-  std::map<int, std::set<int>> tets2seed;  // mostly orderd by tet_ids
-  for (auto& cc_trans : convex_cells_host) {
+  // flat (tet_id, voro_id) hash dedup replaces map<int,set<int>> — same
+  // first-seen-wins over the same iteration order, so the output vector is
+  // bit-identical; the node-based containers were the loop's dominant cost.
+  std::unordered_set<uint64_t> tetSeedSeen;
+  tetSeedSeen.reserve((size_t)n_valid * 2);
+  convex_cells_host_non_dup.reserve(n_valid);
+  for (int ci = 0; ci < n_valid; ++ci) {
+    ConvexCellTransfer& cc_trans = compact_host[ci];
     // this is important!
     // to avoid random value assigned in Status::early_return
     if (!is_convex_cell_valid(cc_trans)) continue;
-    // check if this seed&tet pair has been stored
     // each seed&tet pair should be unique but we might calculate
     // multiple times because of multi-thread, same idea used in
     // get_voro_cell_euler()
-    auto& seed_set = tets2seed[cc_trans.tet_id];
-    if (seed_set.find(cc_trans.voro_id) != seed_set.end()) continue;
-    seed_set.insert(cc_trans.voro_id);
-    // if (cc_trans.voro_id == 4 && cc_trans.tet_id == 33)
-    //   printf("cc_trans.tet_id %d has cc_trans.voro_id: %d\n ",
-    //   cc_trans.tet_id,
-    //          cc_trans.voro_id);
+    const uint64_t key =
+        ((uint64_t)(uint32_t)cc_trans.tet_id << 32) | (uint32_t)cc_trans.voro_id;
+    if (!tetSeedSeen.insert(key).second) continue;
 
-    ConvexCellHost cc_new;
-    copy_cc(cc_trans, cc_new);
-    convex_cells_host_non_dup.push_back(cc_new);
+    convex_cells_host_non_dup.emplace_back();
+    copy_cc(cc_trans, convex_cells_host_non_dup.back());
     // easier for debug
     // assign id for each convex cell as ConvexCellHost::id
     // matching index in convex_cells_host_non_dup
@@ -841,7 +935,6 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   // not freed here -- they are reused across calls. gpu_stat frees itself via
   // its GPUBuffer destructor.
 
-  record.close();
 
   return convex_cells_host_non_dup;
 }
