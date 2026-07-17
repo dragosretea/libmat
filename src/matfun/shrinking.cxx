@@ -903,7 +903,7 @@ bool insert_new_sphere_given_v2fid(
         "[Fix Add] add new_msphere %d, is_good %d, select v2fid_chosen %d as "
         "pin\n ",
         all_medial_spheres.back().id, is_good, v2fid_chosen.second);
-  else
+  else if (!is_good)
     printf("[FixAdd] failed to validate sphere\n");
   return is_good;
 }

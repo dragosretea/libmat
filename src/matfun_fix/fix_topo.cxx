@@ -455,8 +455,14 @@ void fix_topo_facet_cc_euler(
   // only for these two cases
   assert(msphere.pcell.topo_status == Topo_Status::high_facet_cc ||
          msphere.pcell.topo_status == Topo_Status::low_facet_euler);
-  const auto &facet_cc_cells = msphere.pcell.facet_cc_cells;
-  const auto &facet_cc_surf_v2fids = msphere.pcell.facet_cc_surf_v2fids;
+  // Value snapshots, NOT references: insert_new_sphere_given_v2fid() below
+  // grows all_medial_spheres; a reallocation frees msphere's storage, so any
+  // reference into msphere.pcell held across an insert dangles
+  // (use-after-free: segfault or garbage neigh_id -> .at() out_of_range).
+  const auto facet_cc_cells = msphere.pcell.facet_cc_cells;
+  const auto facet_cc_surf_v2fids = msphere.pcell.facet_cc_surf_v2fids;
+  const auto facet_neigh_is_fixed = msphere.pcell.facet_neigh_is_fixed;
+  const Topo_Status topo_status = msphere.pcell.topo_status;
   // if current sphere is a concave sphere,
   // then we will check if newly added sphere close to concave line
   // this check will be large since we have bbox 1000^3
@@ -466,7 +472,7 @@ void fix_topo_facet_cc_euler(
     is_merge_to_ce = true;
   }
   // fix each halfplane faceCC [sphere_id, neigh_id]
-  for (const auto &neigh_is_fixed : msphere.pcell.facet_neigh_is_fixed) {
+  for (const auto &neigh_is_fixed : facet_neigh_is_fixed) {
     int neigh_id = neigh_is_fixed.first;
     const auto &msphere_neigh = all_medial_spheres.at(neigh_id);
     // Many skipping conditions
@@ -494,7 +500,7 @@ void fix_topo_facet_cc_euler(
       printf("[FixFacet] neigh_id %d not contain faceCC of sphere_id %d\n",
              neigh_id, sphere_id);
       printf("[FixFacet] [%d,%d] has FacetCC [%d,%d] \n", sphere_id, neigh_id,
-             msphere.pcell.facet_cc_cells.at(neigh_id).size(),
+             facet_cc_cells.at(neigh_id).size(),
              msphere_neigh.pcell.facet_cc_cells.at(sphere_id).size());
       // assert(false);
       // seems fix_topo_is_delete_or_skip() cannot fix this case
@@ -508,7 +514,7 @@ void fix_topo_facet_cc_euler(
     // we want to add ${#facet_cc -1} new spheres if #facet_cc is wrong
     // or add ${#facet_cc} spheres if #facet_euler is wrong
     int num_new_spheres = fcc_cells_in_group.size() - 1;
-    if (msphere.pcell.topo_status == Topo_Status::low_facet_euler) {
+    if (topo_status == Topo_Status::low_facet_euler) {
       num_new_spheres = fcc_cells_in_group.size();
     }
     if (is_debug)
@@ -665,6 +671,9 @@ void fix_topo_cell_cc_euler(
     printf("]\n");
   }
   // 2. add new spheres
+  // Note: insert_new_sphere_given_v2fid() adds new spheres to
+  // all_medial_spheres which makes the msphere reference from function entry
+  // not stable (vector reallocation) -- re-fetch after every insert
   int num_new_added = 0;
   for (int i = 0; i < num_new_spheres; i++) {
     v2int &v2fid_chosen = v2fid_chosen_vec[i];
@@ -672,22 +681,25 @@ void fix_topo_cell_cc_euler(
       printf(
           "[FixCell] adding %d/%d, msphere %d found v2fid_chosen %d, sf_mesh "
           "facets size:%d\n",
-          i + 1, num_new_spheres, msphere.id, v2fid_chosen.second,
-          sf_mesh.facets.nb());
+          i + 1, num_new_spheres, all_medial_spheres.at(sphere_id).id,
+          v2fid_chosen.second, sf_mesh.facets.nb());
     bool is_good = insert_new_sphere_given_v2fid(
         num_itr_global, sf_mesh, tet_mesh, v2fid_chosen, all_medial_spheres,
         true /*is_merge_to_ce*/, is_debug);
     printf("[FixCell] msphere %d newly added sphere %d is_good: %d\n",
-           msphere.id, all_medial_spheres.back().id, is_good);
+           all_medial_spheres.at(sphere_id).id, all_medial_spheres.back().id,
+           is_good);
     if (is_good) num_new_added++;
   }
   // 3. delete sphere if add nothing
   if (num_new_added == 0) {
-    msphere.is_deleted = true;
+    auto &msphere_now = all_medial_spheres.at(sphere_id);
+    msphere_now.is_deleted = true;
     num_sphere_change++;
     printf(
         "[FixCell] msphere %d cannot add new sphere, topo_status %d, delete \n",
-        msphere.id, msphere.pcell.topo_status, msphere.itr_topo_fix);
+        msphere_now.id, msphere_now.pcell.topo_status,
+        msphere_now.itr_topo_fix);
   }
 }
 
