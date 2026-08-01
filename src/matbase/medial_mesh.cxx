@@ -41,7 +41,20 @@ MedialMesh::MedialMesh(std::vector<MedialSphere>& all_medial_spheres) {
   is_two_faces_on_the_same_sheet.clear();
 };
 
-MedialMesh::~MedialMesh() { delete vertices; };
+// `vertices` is a NON-OWNING alias. Every assignment in the tree takes the
+// address of a caller-owned vector (medial_mesh.cxx:38 and :513, io.cxx:923 and
+// :980, io_wrapper.cpp:828 and :1201, pipeline.cpp:157) -- never a `new` -- and
+// clear() drops it with `vertices = nullptr` rather than deleting. Deleting it
+// here therefore freed memory this class never allocated, in practice a stack
+// vector, which is the `double free or corruption (out)` this pipeline aborted
+// with (SIGABRT, exit 134).
+//
+// The binary survived it only by accident of timing: its MedialMesh is a main()
+// local, so the abort landed at process exit after all results had printed, and
+// run_joint_max.sh's trailing `| awk` made $? report awk's status instead of the
+// binary's. The library cannot survive it -- compute()'s MedialMesh dies on
+// return, before the caller sees anything.
+MedialMesh::~MedialMesh() = default;
 
 void MedialMesh::compute_face_simple_triangles_all() {
   for (int i = 0; i < faces.size(); i++) compute_face_simple_triangles(i);
