@@ -33,8 +33,21 @@ void get_bbox(const std::vector<float>& vertices, float& xmin, float& ymin,
               float& zmin, float& xmax, float& ymax, float& zmax,
               float& bbox_diag_l);
 
+// Prints the v/e/f/t counts and returns the Euler number. Defined in io.cxx;
+// declared here so callers outside that TU can reach it (it previously had
+// external linkage but no declaration).
+int get_tet_euler(const std::vector<float>& tet_vertices,
+                  const std::vector<int>& tet_indices);
+
 bool load_tet(const std::string& filename, std::vector<float>& vertices,
               std::vector<int>& indices, bool normalize, Parameter& params);
+
+// The parameter-derived half of load_tet, for tet meshes already in memory
+// (e.g. produced by TetGen from a surface). Fills the bbox/normalization fields
+// of `params` and, when `normalize` is true, rescales `vertices` into
+// [0, params.scale_max]^3. load_tet is exactly: parse the file, then call this.
+void normalize_tet(std::vector<float>& vertices, std::vector<int>& indices,
+                   bool normalize, Parameter& params);
 
 void load_tet_adj_info(const std::map<int, std::set<int>>& v2tets,
                        const std::vector<int>& tet_indices,

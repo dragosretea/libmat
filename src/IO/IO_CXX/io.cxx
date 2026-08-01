@@ -153,6 +153,17 @@ bool load_tet(const std::string& filename, std::vector<float>& vertices,
   input.close();
   std::cout << "loaded tet_mesh #v: " << n_vertex
             << ", #t: " << indices.size() / 4 << std::endl;
+  normalize_tet(vertices, indices, normalize, params);
+  return true;
+}
+
+// Parameter-derived half of load_tet, split out verbatim so a caller that
+// already has a tet mesh in memory -- e.g. one TetGen produced from a surface,
+// as the matstruct library does -- can populate `params` identically without
+// going through a file.
+void normalize_tet(std::vector<float>& vertices, std::vector<int>& indices,
+                   bool normalize, Parameter& params) {
+  const int n_vertex = (int)vertices.size() / 3;
   get_tet_euler(vertices, indices);
 
   // normalize vertices between [0,1000]^3
@@ -186,6 +197,11 @@ bool load_tet(const std::string& filename, std::vector<float>& vertices,
   }
 
   // update 8 bbox points
+  // clear() first: this loop only push_back's, so without it a second call on
+  // the same Parameter appends another 8 corners instead of replacing them.
+  // No-op for the binary (load_tet runs once per process); required for the
+  // library, which can be called repeatedly.
+  params.bb_points.clear();
   Vector3 pmin(params.xmin, params.ymin, params.zmin);
   Vector3 pmax(params.xmax, params.ymax, params.zmax);
   for (int i = 0; i < 8; i++) {
@@ -201,8 +217,6 @@ bool load_tet(const std::string& filename, std::vector<float>& vertices,
     params.bb_points.push_back(p[1]);
     params.bb_points.push_back(p[2]);
   }
-
-  return true;
 }
 
 void normalize_mesh_given_scale(const float scale_given, const float xmax,
