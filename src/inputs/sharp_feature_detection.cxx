@@ -1,5 +1,7 @@
 #include "sharp_feature_detection.h"
 
+#include <cstdlib>
+
 void load_local_from_mesh(const GEO::Mesh& mesh, std::vector<Vector3>& points,
                           std::vector<Vector3i>& faces) {
   points.clear();
@@ -256,6 +258,106 @@ void update_sf_fe_pairs_attributes(const std::vector<Vector3i>& input_faces,
   }
 }
 
+// Feature-chain filter: drop feature CHAINS (connected runs of feature
+// edges, split at junction vertices of degree > 2) that fail any of:
+//   * total polyline length >= min_len            (minimum feature size)
+//   * mean turning angle at interior vertices <= max_turn_deg
+//   * median dihedral deviation >= min_dev_deg
+// Rationale: real CAD feature edges chain into LONG, STRAIGHT-or-smooth,
+// STRONG-dihedral polylines (letter strokes, box edges: 90 deg, 0 turning),
+// while dihedral false positives on organic/TO tet boundaries are jagged
+// staircase ridges -- short fragments or long zigzags barely past the
+// threshold. This is what makes always-on detection self-gating on organic
+// parts. Read the getenv fallbacks, not comments, for the live defaults.
+static void filter_feature_chains(const std::vector<Vector3>& pts,
+                                  const double min_len,
+                                  const double max_turn_deg,
+                                  const double min_dev_deg,
+                                  const std::map<aint2, double>& dev_deg,
+                                  std::set<aint2>& edges, const char* tag) {
+  if (edges.empty()) return;
+  std::map<int, std::vector<int>> adj;
+  for (const auto& e : edges) {
+    adj[e[0]].push_back(e[1]);
+    adj[e[1]].push_back(e[0]);
+  }
+  // Edge-connected components; junction vertices (deg > 2) do not propagate,
+  // so chains split there exactly like the later corner-based grouping.
+  std::set<aint2> visited;
+  std::vector<aint2> to_drop;
+  size_t n_chains = 0, n_dropped_chains = 0;
+  for (const auto& e0 : edges) {
+    if (visited.count(e0)) continue;
+    std::vector<aint2> chain = {e0};
+    visited.insert(e0);
+    for (size_t k = 0; k < chain.size(); k++) {
+      const aint2 e = chain[k];
+      for (const int v : {e[0], e[1]}) {
+        if (adj.at(v).size() > 2) continue;  // junction: do not cross
+        for (const int w : adj.at(v)) {
+          aint2 next = {{std::min(v, w), std::max(v, w)}};
+          if (visited.count(next)) continue;
+          visited.insert(next);
+          chain.push_back(next);
+        }
+      }
+    }
+    n_chains++;
+
+    // ---- chain statistics ----
+    double len = 0;
+    std::vector<double> devs;
+    std::map<int, std::vector<int>> cadj;  // adjacency within the chain
+    for (const auto& e : chain) {
+      len += (pts[e[0]] - pts[e[1]]).length();
+      auto it = dev_deg.find(e);
+      if (it != dev_deg.end()) devs.push_back(it->second);
+      cadj[e[0]].push_back(e[1]);
+      cadj[e[1]].push_back(e[0]);
+    }
+    double turn_sum = 0;
+    size_t n_turn = 0;
+    for (const auto& [v, nbrs] : cadj) {
+      if (nbrs.size() != 2) continue;  // endpoints/junctions
+      Vector3 d1 = pts[nbrs[0]] - pts[v], d2 = pts[nbrs[1]] - pts[v];
+      const double l1 = d1.length(), l2 = d2.length();
+      if (l1 <= 0 || l2 <= 0) continue;
+      double c = GEO::dot(d1, d2) / (l1 * l2);
+      c = std::max(-1.0, std::min(1.0, c));
+      turn_sum += 180.0 - std::acos(c) * 180.0 / PI;  // 0 = collinear
+      n_turn++;
+    }
+    const double mean_turn = n_turn ? turn_sum / n_turn : 0.0;
+    double med_dev = 0;
+    if (!devs.empty()) {
+      std::nth_element(devs.begin(), devs.begin() + devs.size() / 2,
+                       devs.end());
+      med_dev = devs[devs.size() / 2];
+    }
+
+    const bool keep = len >= min_len &&
+                      (max_turn_deg <= 0 || mean_turn <= max_turn_deg) &&
+                      (min_dev_deg <= 0 || devs.empty() ||
+                       med_dev >= min_dev_deg);
+    if (!keep) {
+      n_dropped_chains++;
+      to_drop.insert(to_drop.end(), chain.begin(), chain.end());
+    } else {
+      printf(
+          "[Feature] %s chain kept: %zu edges, len=%.4g, mean_turn=%.1f deg, "
+          "med_dev=%.1f deg\n",
+          tag, chain.size(), len, mean_turn, med_dev);
+    }
+  }
+  const size_t n_dropped_edges = to_drop.size();
+  for (const auto& e : to_drop) edges.erase(e);
+  printf(
+      "[Feature] %s chain filter: %zu/%zu chains dropped (%zu edges, "
+      "min_len=%.4g, max_turn=%.4g, min_dev=%.4g)\n",
+      tag, n_dropped_chains, n_chains, n_dropped_edges, min_len, max_turn_deg,
+      min_dev_deg);
+}
+
 // here input_faces are sorted counter-clockwise, from SurfaceMesh
 void find_feature_edges(const Parameter& args,
                         const std::vector<Vector3>& input_vertices,
@@ -269,6 +371,7 @@ void find_feature_edges(const Parameter& args,
   corners_ce.clear();
 
   std::vector<aint2> edges;
+  std::map<aint2, double> edge_dev_deg;  // dihedral deviation per feature edge
   std::map<int, std::unordered_set<int>> conn_tris;
   for (int i = 0; i < input_faces.size(); i++) {
     const auto& f = input_faces[i];
@@ -348,6 +451,14 @@ void find_feature_edges(const Parameter& args,
       // check convex or concave
       EdgeConvexConcave edge_type = is_convex_concave_or_not(
           args.thres_convex, args.thres_concave, n, n1, edge_dir, is_debug);
+      if (edge_type == EdgeConvexConcave::CONVEX ||
+          edge_type == EdgeConvexConcave::CONCAVE) {
+        // deviation from flat between the two normalized face normals; the
+        // chain filter uses the per-chain median as dihedral strength
+        double c = GEO::dot(n, n1);
+        c = std::max(-1.0, std::min(1.0, c));
+        edge_dev_deg[e] = std::acos(c) * 180.0 / PI;
+      }
       if (edge_type == EdgeConvexConcave::CONVEX) {
         s_edges.insert(e);
       } else if (edge_type == EdgeConvexConcave::CONCAVE) {
@@ -357,6 +468,24 @@ void find_feature_edges(const Parameter& args,
   }  // for edges
 
   // vector_unique(s_edges);
+
+  // Chain filter: kill noise chains BEFORE corner extraction so corners
+  // derived from noise edges vanish with them. Read the getenv fallbacks,
+  // not this comment, for live defaults; 0 disables a criterion.
+  {
+    double minlen_rel = 0.05, max_turn = 20.0, min_dev = 0.0;
+    if (const char* env = std::getenv("MSD_FEAT_MINLEN_REL"))
+      minlen_rel = std::atof(env);
+    if (const char* env = std::getenv("MSD_FEAT_MAXTURN"))
+      max_turn = std::atof(env);
+    if (const char* env = std::getenv("MSD_FEAT_MINDEV"))
+      min_dev = std::atof(env);
+    const double min_len = minlen_rel * args.bbox_diag_l;
+    filter_feature_chains(input_vertices, min_len, max_turn, min_dev,
+                          edge_dev_deg, s_edges, "SE");
+    filter_feature_chains(input_vertices, min_len, max_turn, min_dev,
+                          edge_dev_deg, cc_edges, "CE");
+  }
 
   // for finding corners
   std::map<int, std::set<int>> neighbor_v_se, neighbor_v_ce;
