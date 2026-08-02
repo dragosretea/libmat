@@ -160,6 +160,7 @@ void Thinning::prune_tets_while_iteration(
 
   while (true) {
     if (is_debug) printf("still %d mat tets to prune \n", mat.numTets_active);
+    bool pruned_this_pass = false;
     for (const auto& imp_pair : imp_queue) {
       double f_imp = imp_pair.first;
       int fid = imp_pair.second;
@@ -186,11 +187,37 @@ void Thinning::prune_tets_while_iteration(
       // taking care of dup_cnt
       if (is_dup_cnt)
         postprocess_dupcnt_tet_face(mat, tid, fid, is_debug /*is_debug*/);
+      pruned_this_pass = true;
       break;
     }  // for imp_queue
 
     // break while loop once we have all tets cleaned
     if (mat.numTets_active == 0) break;
+
+    // TRIPWIRE, not a fix (2026-08-02): a full queue pass that prunes
+    // nothing while active tets remain used to spin here FOREVER (observed:
+    // a letter-E fTetWild draw hung 4h+ with zero output). Reaching this
+    // means either no free (single-tet) face exists in the remaining pocket
+    // complex, or numTets_active drifted from the true count. Both are
+    // upstream invariant violations that need a captured reproduction --
+    // dump the state loudly and stop peeling instead of hanging.
+    if (!pruned_this_pass) {
+      int n_free = 0, n_multi = 0, n_alive_faces = 0;
+      for (const auto& imp_pair : imp_queue) {
+        const auto& face = mat.faces[imp_pair.second];
+        if (face.is_deleted) continue;
+        n_alive_faces++;
+        if (face.tets_.size() == 1) n_free++;
+        if (face.tets_.size() > 1) n_multi++;
+      }
+      printf(
+          "[Prune] ERROR: tet peel made NO progress: numTets_active=%d, "
+          "alive faces=%d (free=%d, multi-tet=%d). Pocket complex is "
+          "unpeelable or bookkeeping drifted -- ABORTING tet prune, "
+          "REPORT THIS DRAW.\n",
+          mat.numTets_active, n_alive_faces, n_free, n_multi);
+      break;
+    }
   }  // while true
 }
 
