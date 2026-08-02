@@ -11,4 +11,5 @@ int check_and_fix_external_feature(
     const std::vector<ConvexCellHost>& convex_cells_host,
     const SurfaceMesh& sf_mesh, const std::map<aint4, int>& tet_vs_lfs2tvs_map,
     const std::map<int, std::set<int>>& fl2corner_sphere,
+    const std::vector<FeatureLine>& se_lines,
     std::vector<MedialSphere>& all_medial_spheres, bool is_debug);

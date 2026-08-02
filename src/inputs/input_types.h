@@ -96,6 +96,11 @@ class FeatureLine {
   std::map<aint2, int> t2vs_to_feid;  // <tvid_min, tvid_max> -> FeatureEdge::id
   std::map<int, aint2> tvs_neighbors;  // tvid -> {tvid_left/-1, tvid_right/-1}
   double length = 0.f;                 // length of the whole feature line
+  // Median dihedral angle across this line's feature edges, in degrees --
+  // 90 for a true box edge, ~55-75 for the soft ridges detection picks up on
+  // topology-optimized boundaries. -1 if not computed. Feature STRENGTH: used
+  // to scale how densely the line is populated with SE constraint spheres.
+  double dev_deg = -1.0;
   std::vector<FL_Sample> samples;      // sample points on feature line
 
   // feature edge fe: <tvid_min, tvid_max>

@@ -296,6 +296,7 @@ int check_and_fix_external_feature(
     const std::vector<ConvexCellHost>& convex_cells_host,
     const SurfaceMesh& sf_mesh, const std::map<aint4, int>& tet_vs_lfs2tvs_map,
     const std::map<int, std::set<int>>& fl2corner_sphere,
+    const std::vector<FeatureLine>& se_lines,
     std::vector<MedialSphere>& all_medial_spheres, bool is_debug) {
   // Spacing-based admission on the feature line. Candidate centers are emitted
   // at fe_abs_len spacing, but they are emitted independently by EVERY sphere
@@ -317,9 +318,45 @@ int check_and_fix_external_feature(
   // bounds the SE population by total feature-line length, which cannot
   // cascade: the cube settles at 608 SE spheres against a ~693 geometric
   // ceiling, where it previously reached 21138 and died.
+  // FEATURE-STRENGTH-SCALED SPACING (MSD_FEAT_SPACING_W=0 restores uniform).
+  // Detection is binary -- an edge is a feature or it is not -- but the
+  // evidence behind it is not. FeatureLine::dev_deg is the median dihedral
+  // across the line: 90 deg on every line of a unit cube, but 56-68 on cant11
+  // and 55-77 on mbb01/mbb04, i.e. barely past thres_convex. Those soft
+  // topology-optimized ridges got exactly the same treatment as a box edge,
+  // and every SE sphere is a CONVERSION -- an interior medial sphere becomes a
+  // degenerate boundary constraint site, so the medial volume it represented is
+  // lost and coverage-based IoU drops.
+  //
+  // Rather than weight each projection (an iterated lerp toward the curve is a
+  // delay, not a weight -- it converges to a full snap anyway and forfeits the
+  // idempotence that makes the extf loop terminate), scale the SPACING. That is
+  // a static property of the line, so it stays idempotent by construction, and
+  // it lands on the admission test that already governs SE density.
+  //
+  // A 90 deg line keeps w=1 and its current density, so parts made of true
+  // sharp edges are bit-identical. Weaker lines get proportionally sparser
+  // constraint sites and keep more of their medial volume.
+  const double kDevHi = 90.0;                  // a true box edge
+  const double kDevLo = param.thres_convex;    // detection threshold (55)
+  const double kWMin = 0.15;                   // at most ~6.7x sparser
+  static const bool useStrengthW = [] {
+    const char* v = std::getenv("MSD_FEAT_SPACING_W");
+    return v ? atoi(v) != 0 : true;
+  }();
+  auto se_spacing_scale = [&](const int fl_id) -> double {
+    if (!useStrengthW) return 1.0;
+    if (fl_id < 0 || fl_id >= (int)se_lines.size()) return 1.0;  // CE line
+    const double dev = se_lines.at(fl_id).dev_deg;
+    if (dev < 0) return 1.0;  // strength not computed
+    double w = (dev - kDevLo) / (kDevHi - kDevLo);
+    w = std::max(0.0, std::min(1.0, w));
+    return 1.0 / std::max(w, kWMin);
+  };
+
   int num_se_rejected = 0;
   auto add_new_se_sphere =
-      [&all_medial_spheres, &num_se_rejected, &sf_mesh](
+      [&all_medial_spheres, &num_se_rejected, &sf_mesh, &se_spacing_scale](
          const int num_itr_global, const int start_row, const Vector3& raw_center,
          const double radius, const aint2 cur_se_info, const double spacing,
          std::vector<MedialSphere>& new_medial_spheres, bool is_debug) {
@@ -337,7 +374,8 @@ int check_and_fix_external_feature(
         // does a spacing test along the edge mean anything.
         Vector3 center = raw_center;
         sf_mesh.aabb_wrapper.project_to_se(center);  // no-op if no SE mesh
-        const double min_sq = (0.5 * spacing) * (0.5 * spacing);
+        const double sep = 0.5 * spacing * se_spacing_scale(cur_se_info[0]);
+        const double min_sq = sep * sep;
         // Deliberately NOT keyed on se_line_id. Candidates for the same
         // physical edge are tagged with differing line ids (a same-line test
         // rejected only ~68 per pass while 3968 were admitted -- impossible if

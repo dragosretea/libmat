@@ -1030,6 +1030,42 @@ void detect_mark_sharp_features(const Parameter& args, SurfaceMesh& sf_mesh,
   sf_mesh.update_fe_sf_fs_pairs_to_ce_id(tet_mesh.feature_edges);
   printf("[Feature] stored SphereType::CE line size: %ld \n",
          tet_mesh.ce_lines.size());
+
+  // Per-line feature STRENGTH: median dihedral angle across the line's feature
+  // edges. filter_feature_chains already computes this statistic to decide
+  // keep-vs-drop, but discards it, so downstream every surviving edge looks
+  // identical -- a 90 deg box edge and a 56 deg topology-optimized ridge get
+  // the same hard treatment. Recomputed here from FeatureEdge::adj_sf_fs_pair
+  // rather than plumbed through the filter, because that statistic is keyed on
+  // SURFACE vertices while feature lines are built on TET vertices.
+  //
+  // Measured spread: unit cube 90.0 on all 12 lines; cant11 56.5/60.6/67.6;
+  // mbb01 57.3..76.5 plus one 98.5; mbb04 55.3..72.0 plus one 94.9.
+  auto compute_line_dev = [&](std::vector<FeatureLine>& lines) {
+    for (auto& fl : lines) {
+      std::vector<double> devs;
+      for (const int fe_id : fl.fe_ids) {
+        if (fe_id < 0 || fe_id >= (int)tet_mesh.feature_edges.size()) continue;
+        const auto& fe = tet_mesh.feature_edges.at(fe_id);
+        if (fe.adj_sf_fs_pair[0] < 0 || fe.adj_sf_fs_pair[1] < 0) continue;
+        const Vector3 n1 = GEO::Geom::mesh_facet_normal(sf_mesh, fe.adj_sf_fs_pair[0]);
+        const Vector3 n2 = GEO::Geom::mesh_facet_normal(sf_mesh, fe.adj_sf_fs_pair[1]);
+        const double l1 = n1.length(), l2 = n2.length();
+        if (l1 <= 0 || l2 <= 0) continue;
+        double c = GEO::dot(n1, n2) / (l1 * l2);
+        c = std::max(-1.0, std::min(1.0, c));
+        devs.push_back(std::acos(c) * 180.0 / PI);  // 0 = coplanar
+      }
+      if (devs.empty()) continue;
+      std::nth_element(devs.begin(), devs.begin() + devs.size() / 2, devs.end());
+      fl.dev_deg = devs[devs.size() / 2];
+    }
+  };
+  compute_line_dev(tet_mesh.se_lines);
+  compute_line_dev(tet_mesh.ce_lines);
+  for (const auto& fl : tet_mesh.se_lines)
+    printf("[Feature] SE line %d: %zu edges, strength %.1f deg\n", fl.id,
+           fl.fe_ids.size(), fl.dev_deg);
   // print_corner2fl(tet_mesh.corner2fl);
   // print_corner2fe(tet_mesh.corner2fe);
 
