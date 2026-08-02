@@ -294,13 +294,65 @@ int check_and_fix_external_feature(
     const int num_itr_global, const Parameter& param,
     const std::vector<float>& tet_vertices,
     const std::vector<ConvexCellHost>& convex_cells_host,
-    const GEO::Mesh& sf_mesh, const std::map<aint4, int>& tet_vs_lfs2tvs_map,
+    const SurfaceMesh& sf_mesh, const std::map<aint4, int>& tet_vs_lfs2tvs_map,
     const std::map<int, std::set<int>>& fl2corner_sphere,
     std::vector<MedialSphere>& all_medial_spheres, bool is_debug) {
+  // Spacing-based admission on the feature line. Candidate centers are emitted
+  // at fe_abs_len spacing, but they are emitted independently by EVERY sphere
+  // covering a given sharp edge, so a single pass re-proposes the same
+  // positions along a shared feature line many times over. The only downstream
+  // filter, add_new_sphere_validate, needs center distance <= SCALAR_1 (== 1 on
+  // a [0,1000]^3 model) AND |dr| <= 1, which never rejects candidates a few
+  // units apart at fe_abs_len ~= 34.6 spacing. Measured on the unit-cube smoke:
+  // 5481 SE spheres admitted in one iteration, 8124 total against the ~600 the
+  // spacing implies (13x), then a CUDA OOM in compute_tet_sphere_relation,
+  // whose buffers are dense #tets x #spheres. The same runaway breaks
+  // feature-bearing parts of the 100-part set (mbb01/mbb04 OOM; cant11 dies in
+  // a NaN power cell).
+  //
+  // Admit a candidate only when no existing SE sphere already sits within half
+  // the intended spacing -- checked against both the committed spheres and
+  // those already accepted in this pass, and BEFORE apply_perturb so the test
+  // sees the exact generated position. Combined with the snap below, this
+  // bounds the SE population by total feature-line length, which cannot
+  // cascade: the cube settles at 608 SE spheres against a ~693 geometric
+  // ceiling, where it previously reached 21138 and died.
+  int num_se_rejected = 0;
   auto add_new_se_sphere =
-      [](const int num_itr_global, const int start_row, const Vector3& center,
-         const double radius, const aint2 cur_se_info,
+      [&all_medial_spheres, &num_se_rejected, &sf_mesh](
+         const int num_itr_global, const int start_row, const Vector3& raw_center,
+         const double radius, const aint2 cur_se_info, const double spacing,
          std::vector<MedialSphere>& new_medial_spheres, bool is_debug) {
+        // SNAP to the actual feature edge first. Candidate centers come from
+        // add_new_centers_given_one_se_group, which interpolates between
+        // positions in tvs_pos_map -- and that map is built by
+        // convert_fes_from_ccell_to_tet, which (per its own comment) assigns
+        // NEWLY CUT convex-cell vertices a negative id. Those are clip-plane
+        // intersections, not points on the sharp edge, so as spheres multiply
+        // the candidates drift off the feature line and scatter through the
+        // volume. Measured on the cube: 4852 candidates admitted in one pass,
+        // each supposedly >= spacing/2 from every other -- geometrically
+        // impossible on 12 edges (~693 fit), which is how we know they were not
+        // on the edges at all. Snapping makes the position exact, and only then
+        // does a spacing test along the edge mean anything.
+        Vector3 center = raw_center;
+        sf_mesh.aabb_wrapper.project_to_se(center);  // no-op if no SE mesh
+        const double min_sq = (0.5 * spacing) * (0.5 * spacing);
+        // Deliberately NOT keyed on se_line_id. Candidates for the same
+        // physical edge are tagged with differing line ids (a same-line test
+        // rejected only ~68 per pass while 3968 were admitted -- impossible if
+        // they were genuinely spaced on shared lines), so the id is not a
+        // reliable grouping key here. Two SE spheres within half the intended
+        // spacing are redundant whichever line they claim; corners keep their
+        // own T_1_N spheres, so nothing is lost where lines meet.
+        auto too_close_on_line = [&](const MedialSphere& ms) {
+          if (ms.is_deleted || !ms.is_on_se()) return false;
+          return (ms.center - center).length2() < min_sq;
+        };
+        for (const auto& ms : all_medial_spheres)
+          if (too_close_on_line(ms)) { num_se_rejected++; return; }
+        for (const auto& ms : new_medial_spheres)
+          if (too_close_on_line(ms)) { num_se_rejected++; return; }
         uint mid = start_row + new_medial_spheres.size();
         MedialSphere new_msphere(mid, center, radius, SphereType::T_1_2 /*SE*/,
                                  num_itr_global);
@@ -364,7 +416,7 @@ int check_and_fix_external_feature(
       v2int2 newc_fl_info = new_centers_fl[cidx];
       add_new_se_sphere(num_itr_global, all_medial_spheres.size(),
                         newc_fl_info.first, radius, newc_fl_info.second,
-                        new_medial_spheres, is_debug);
+                        fe_abs_len, new_medial_spheres, is_debug);
     }  // for new_centers
 
   }  // for all_medial_spheres
@@ -377,8 +429,9 @@ int check_and_fix_external_feature(
     }
   }
   printf(
-      "[FIX_EXTF] changed %d including %d added new external feature spheres\n",
-      num_changed, num_added);
+      "[FIX_EXTF] changed %d including %d added new external feature spheres "
+      "(%d candidates rejected by feature-line spacing)\n",
+      num_changed, num_added, num_se_rejected);
 
   return num_changed;
 }
