@@ -500,7 +500,21 @@ void get_k_ring_neighbors_no_cross(const GEO::Mesh& sf_mesh,
                                    bool is_clear_cur, bool is_debug) {
   if (is_debug)
     printf("calling get_k_ring_neighbor_no_se for fid_given: %d \n", fid_given);
-  assert(fid_given >= 0);
+  // An assert is not a guard here: this project builds Release, so NDEBUG
+  // deleted the only check on a precondition the author clearly expected to be
+  // violable. fid_given is a surface facet id that callers derive from a
+  // projection, and a failed projection yields UNK_FACE (-1) -- which then got
+  // inserted into k_ring_fids and traversed as a facet index, i.e. SIGSEGV.
+  // Reached via TangentPlane's ctor from shrink_post_process on mbb01 whenever
+  // SE constraint spheres are sparse enough for such a shrink to be attempted.
+  if (fid_given < 0) {
+    static int n_warned = 0;
+    if (n_warned++ < 5)
+      printf("[K_RING] WARNING: invalid fid_given %d, returning no neighbors\n",
+             fid_given);
+    if (is_clear_cur) k_ring_fids.clear();
+    return;
+  }
 
   if (is_clear_cur) k_ring_fids.clear();
   k_ring_fids.insert(fid_given);
