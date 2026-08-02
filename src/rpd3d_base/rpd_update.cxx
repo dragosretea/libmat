@@ -112,6 +112,26 @@ void get_all_voro_info(const std::vector<ConvexCellHost>& voro_convex_cells,
   // collect info of vertex/facet/edge <-> cell_ids
   for (uint i = 0; i < voro_convex_cells.size(); i++) {
     auto& cc_trans = voro_convex_cells[i];
+    // Skip a cell whose explicit geometry could not be built. When
+    // compute_vertex_coordinates() yields NaN (its 3x3 determinant goes to ~0
+    // for near-coplanar clip planes), ConvexCellHost::reload_pc_explicit()
+    // reports it, sets is_vertex_null and RETURNS EARLY -- leaving pc_points
+    // short, pc_local_active_faces stale, and is_pc_explicit false, since that
+    // is only set at the end of the function.
+    //
+    // is_vertex_null was written there and read NOWHERE, and the sole guard on
+    // the downstream read was assert(is_pc_explicit) in get_cell_v2surffid --
+    // compiled out under NDEBUG. So a Release build walked straight into
+    // pc_points.at() past the end and threw std::out_of_range. Observed on
+    // cant11 before the SE-runaway fix (libmat e61015b) removed that particular
+    // source of degenerate sites; any other cause of a NaN cell reaches here
+    // the same way, so the guard belongs at the read, not at that one trigger.
+    //
+    // Dropping the cell is the honest option: its vertices are unusable, so
+    // consuming it partially would silently corrupt the power-cell topology
+    // instead. reload_pc_explicit() has already printed the ERROR, so the
+    // occurrence stays visible without printing again per cell.
+    if (cc_trans.is_vertex_null || !cc_trans.is_pc_explicit) continue;
     int cell_id = cc_trans.id;
     assert(cc_trans.is_active_updated);
     const auto& active_clipping_planes = cc_trans.active_clipping_planes;
