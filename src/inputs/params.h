@@ -66,8 +66,6 @@ struct Parameter {
   double SphereType_T1_INF_VARIANCE = 0.25;
   double SphereType_T2_INF_VARIANCE = 0.5;
 
-  bool is_run_cad = true;
-  bool is_run_organic = false;
   bool is_run_weak = false;
   bool is_sample_rpd = true;
 };
@@ -92,7 +90,6 @@ constexpr unsigned int GEO_SAMPLE_MAX = 10000;
 // Intf/Extf fix
 // for non_cad models
 constexpr int INTF_ITR_MAX = 5;
-constexpr int EXTF_ITR_MAX = 5;
 
 #define RAN_SEED 200                // random seed
 #define SCALAR_FEATURE_RADIUS 1e-1  // for SE sphere
