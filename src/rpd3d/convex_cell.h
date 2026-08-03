@@ -223,8 +223,8 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
     const size_t vert_pitch, const int* idx, const int n_tet,
     const size_t idx_pitch, const int* v_adjs, const int* e_adj_offsets,
     const int* e_adj_neighbors, const int* e_adj_vals, const int* f_adjs,
-    const int* f_ids, const int* tet_knn, const size_t tet_knn_pitch,
-    const int tet_k, Status* gpu_stat, VoronoiCell* voronoi_cells,
+    const int* f_ids, const int* tet_knn_csr, const int* slot2tet,
+    const int n_slots, Status* gpu_stat, VoronoiCell* voronoi_cells,
     ConvexCellTransfer* convex_cells_dev, float* cell_bary_sum,
     const size_t cell_bary_sum_pitch, float* cell_vol);
 

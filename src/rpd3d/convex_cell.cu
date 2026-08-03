@@ -1171,31 +1171,35 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
     const int n_vert, const size_t vert_pitch, const int* idx, const int n_tet,
     const size_t idx_pitch, const int* v_adjs, const int* e_adj_offsets,
     const int* e_adj_neighbors, const int* e_adj_vals, const int* f_adjs,
-    const int* f_ids, const int* tet_knn, const size_t tet_knn_pitch,
-    const int tet_k, Status* gpu_stat, VoronoiCell* voronoi_cells,
+    const int* f_ids, const int* tet_knn_csr, const int* slot2tet,
+    const int n_slots, Status* gpu_stat, VoronoiCell* voronoi_cells,
     ConvexCellTransfer* convex_cells_dev, float* cell_bary_sum,
     const size_t cell_bary_sum_pitch, float* cell_vol) {
   bool is_debug = false;
   FOR(i, n_vert) { assert(v_adjs[i] > 0); }
 
-  int thread = blockIdx.x * blockDim.x + threadIdx.x;  // thread id
-  int tid = thread / tet_k;                            // tet index
+  // One thread per CSR slot = per (tet, related sphere) pair that actually
+  // exists. Slots are laid out tet-major with the spheres of a tet ascending,
+  // i.e. the same order the dense (tet_k-strided) layout visited them, so the
+  // valid cells reach the host in an unchanged order -- only the -1 padding
+  // slots, which always took the early_return path below, are gone.
+  int thread = blockIdx.x * blockDim.x + threadIdx.x;  // thread id = slot id
 
-  // we define n_grids = n_tet * tet_k / VORO_BLOCK_SIZE + 1;
-  // so tid may == n_tet, this would cause problem later
-  if (tid >= n_tet) {
+  // n_grids = n_slots / VORO_BLOCK_SIZE + 1 always launches a partial trailing
+  // block, so thread may run past the last slot.
+  if (thread >= n_slots) {
     if (is_debug)
-      printf("[clipped] tid %d out of bound [0, %d) \n", tid, n_tet);
+      printf("[clipped] slot %d out of bound [0, %d) \n", thread, n_slots);
     // to avoid random value assigned to thread
     convex_cells_dev[thread].status = Status::early_return;
     return;
   }
-  int seed = tet_knn[(thread % tet_k) * tet_knn_pitch + tid];
-  // happens when #(tet_related_spheres) < tet_k
-  // and we init as -1
-  if (seed < 0 || seed >= n_site) {
+  int tid = slot2tet[thread];   // tet index
+  int seed = tet_knn_csr[thread];
+  if (tid < 0 || tid >= n_tet || seed < 0 || seed >= n_site) {
     if (is_debug)
-      printf("[clipped] seed %d out of bound [0, %d) \n", seed, n_site);
+      printf("[clipped] slot %d: tid %d / seed %d out of bound \n", thread, tid,
+             seed);
     // to avoid random value assigned to thread
     convex_cells_dev[thread].status = Status::early_return;
     return;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <unordered_set>
 
 #include "convex_cell.h"
@@ -161,6 +162,11 @@ __global__ void tet_sphere_relations_dev(
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= n_tet) return;
 
+  // The tet's 4 vertex ids do not depend on the site -- load them once instead
+  // of re-reading idx_dev inside the (n_site x site_k) double loop.
+  int v_ids[4];
+  FOR(t, 4) v_ids[t] = idx_dev[tid + t * idx_pitch];
+
   // each thread handles all n_site
   FOR(si_idx, n_site) {
     // case 1: if si is not selected, then tet is not related to si
@@ -169,33 +175,44 @@ __global__ void tet_sphere_relations_dev(
       continue;
     }
     // case 2: find all neighboring site of sphere i (see note)
-    int num_relate_hp = 0;
-    int site_real_k = 0;  // some may be -1
+    //
+    // pd(v, si) is invariant across the neighbour loop -- hoist the 4 loads
+    // out of it (they were re-read site_k times each).
+    float pd_i[4];
+    FOR(t, 4) pd_i[t] = pdist_dev[v_ids[t] + si_idx * pdist_pitch];
+
+    // The original accumulated num_relate_hp and site_real_k over ALL site_k
+    // neighbours, then set is_relate = (num_relate_hp == site_real_k). Both
+    // counters rise by at most 1 per neighbour and num_relate_hp only rises
+    // when the neighbour passes, so the FIRST failing neighbour opens a gap
+    // that can never close: the result is already decided as 0. Bailing there
+    // is exactly equivalent, and the relation is ~0.06% dense, so almost every
+    // (tet, site) pair now exits after a neighbour or two instead of 62.
+    int is_relate = 1;
     FOR(sm, site_k) {
       int sm_idx = site_knn_dev[si_idx + sm * site_knn_pitch];
-      if (sm_idx == -1) continue;
-      site_real_k += 1;
+      if (sm_idx == -1) continue;  // some may be -1
+      bool any_closer = false;
       FOR(t, 4) {
-        int v_idx = idx_dev[tid + t * idx_pitch];
-        // get power distances to sphere i and sphere m
-        float pd_i = pdist_dev[v_idx + si_idx * pdist_pitch];
-        float pd_m = pdist_dev[v_idx + sm_idx * pdist_pitch];
-        // tet vertex v_idx closer to sphere i than j
-        if (pd_m > pd_i) {
-          num_relate_hp += 1;
+        // tet vertex v_ids[t] closer to sphere i than j
+        if (pdist_dev[v_ids[t] + sm_idx * pdist_pitch] > pd_i[t]) {
+          any_closer = true;
           break;
         }
       }  // 4 tet vertices
+      if (!any_closer) {
+        is_relate = 0;
+        break;
+      }
     }  // for site_k (all neighbor spheres)
 
-    int is_relate = num_relate_hp == site_real_k ? 1 : 0;
     tet_sphere_relate_dev[tid + si_idx * tet_sphere_relate_pitch] = is_relate;
   }  // for n_site
 }
 
-// Device-side helpers for compute_tet_sphere_relation: the tet_knn matrix is
-// built directly on the GPU (ascending sid per tet = same order as the old
-// host loop, so the resulting device matrix is bit-identical). This removes a
+// Device-side helpers for compute_tet_sphere_relation: the tet-to-sphere
+// relation is built directly on the GPU (ascending sid per tet = same order as
+// the old host loop, so the result is bit-identical). This removes a
 // #site x #tet D2H copy and a single-threaded O(#site * #tet) host loop per
 // RPD call.
 __global__ void count_tet_related_spheres(const int* rel,
@@ -210,19 +227,28 @@ __global__ void count_tet_related_spheres(const int* rel,
   counts[tid] = c;
 }
 
-__global__ void fill_tet_knn_dev(const int* rel, const size_t rel_pitch,
-                                 const int n_tet, const int n_site,
-                                 const int tet_k, const size_t tet_knn_pitch,
-                                 int* tet_knn) {
+// CSR fill. Slot s = tet_offsets[tid] + k holds the k-th related sphere of tet
+// tid, in ascending sid -- exactly the content the dense layout put at
+// tet_knn[k][tid], minus the -1 padding. slot2tet[s] = tid lets the RPD kernel
+// recover its tet from a flat slot index without a search.
+//
+// The dense layout reserved max-over-ALL-tets slots for EVERY tet, so one
+// locally dense cluster of spheres charged the whole mesh: 146k tets x max 16
+// x 3456 B/ConvexCellTransfer = 8.1 GB of RPD output buffer on a 6 GB card.
+__global__ void fill_tet_knn_csr_dev(const int* rel, const size_t rel_pitch,
+                                     const int n_tet, const int n_site,
+                                     const int* tet_offsets, int* tet_knn_csr,
+                                     int* slot2tet) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= n_tet) return;
-  int k = 0;
-  for (int sid = 0; sid < n_site; ++sid)
+  int s = tet_offsets[tid];
+  const int end = tet_offsets[tid + 1];
+  for (int sid = 0; sid < n_site && s < end; ++sid)
     if (rel[sid * rel_pitch + tid] == 1) {
-      tet_knn[(size_t)k * tet_knn_pitch + tid] = sid;
-      ++k;
+      tet_knn_csr[s] = sid;
+      slot2tet[s] = tid;
+      ++s;
     }
-  for (; k < tet_k; ++k) tet_knn[(size_t)k * tet_knn_pitch + tid] = -1;
 }
 
 // Stable stream compaction of the per-(tet,seed) convex-cell output: the old
@@ -259,27 +285,41 @@ void compute_tet_sphere_relation(
     const float* site_dev, const uint* site_flags_dev, const int n_site,
     const size_t site_pitch, const float* site_weights_dev,
     const int* site_knn_dev, const int site_k, const size_t site_knn_pitch,
-    int*& tet_sphere_relate_dev_out, size_t& tet_sphere_relate_pitch_out,
-    int& tet_k) {
+    float* tet_pdist_dev, const size_t tet_pdist_pitch,
+    int* tet_sphere_relate_dev, const size_t tet_sphere_relate_pitch,
+    int& tet_k, std::vector<int>& tet_counts) {
   // printf("calling compute_tet_sphere_relation... \n");
 
+  // Opt-in sub-attribution of this function (it is ~87% of the RPD phase on
+  // large CAD parts). Each mark syncs the device first, so the numbers are
+  // real per-step costs rather than async launch times -- which is why it is
+  // OFF unless MSD_PROF_TETSPHERE is set.
+  static const bool s_profTS = std::getenv("MSD_PROF_TETSPHERE") != nullptr;
+  auto ts_now = [&]() {
+    if (s_profTS) cudaDeviceSynchronize();
+    return std::chrono::steady_clock::now();
+  };
+  auto ts_t0 = ts_now();
+  auto ts_mark = [&](const char* what) {
+    if (!s_profTS) return;
+    const auto t = ts_now();
+    printf("[tet_sphere] %-18s %7.3f s\n", what,
+           std::chrono::duration<double>(t - ts_t0).count());
+    ts_t0 = t;
+  };
+
   assert(site_pitch > 0);  // always transposed
-  cudaError_t err0;
   // step 1: compute power distancese for each tet vertex
-  // allocate global memory for power distance matrix
-  // size: #spheres x #tet_vertices
-  float* tet_pdist_dev = nullptr;
-  size_t tet_pdist_pitch_in_bytes;
-  err0 = cudaMallocPitch((void**)&tet_pdist_dev, &tet_pdist_pitch_in_bytes,
-                         n_vert * sizeof(float), n_site);
-  if (err0 != cudaSuccess) {
-    printf("ERROR: Memory allocation error\n");
-    cudaFree(tet_pdist_dev);
-  }
-  size_t tet_pdist_pitch = tet_pdist_pitch_in_bytes / sizeof(float);
+  // (the #spheres x #tet_vertices pdist matrix and the #spheres x #tets
+  // relation matrix are now owned by the caller's grow-only device cache --
+  // they used to be cudaMallocPitch'd and cudaFree'd on EVERY call, which on a
+  // large CAD part is ~2.5 GB of allocator churn per RPD call, and cudaFree
+  // synchronises the device)
+  ts_mark("entry");
   power_dist_cuda_global_dev(site_dev, n_site, site_pitch, site_weights_dev,
                              vert_dev, n_vert, vert_pitch, 3, tet_pdist_dev,
                              tet_pdist_pitch);
+  ts_mark("kernel_pdist");
 
   // (debug D2H copy of the full tet_pdist matrix removed -- it fed only
   // commented-out prints and cost a ~15MB transfer per RPD call)
@@ -299,25 +339,17 @@ void compute_tet_sphere_relation(
   // value:
   // 1: tet relates to sphere
   // 0: not relate
-  int* tet_sphere_relate_dev = nullptr;
-  size_t tet_sphere_relate_pitch_in_bytes;
-  err0 = cudaMallocPitch((void**)&tet_sphere_relate_dev,
-                         &tet_sphere_relate_pitch_in_bytes, n_tet * sizeof(int),
-                         n_site);
-  if (err0 != cudaSuccess) {
-    printf("ERROR: Memory allocation error\n");
-    cudaFree(tet_sphere_relate_dev);
-  }
-  size_t tet_sphere_relate_pitch =
-      tet_sphere_relate_pitch_in_bytes / sizeof(int);
   tet_sphere_relations_dev<<<n_tet / VORO_BLOCK_SIZE + 1, VORO_BLOCK_SIZE>>>(
       n_vert, idx_dev, n_tet, idx_pitch, n_site, site_flags_dev, site_knn_dev,
       site_knn_pitch, site_k, tet_pdist_dev, tet_pdist_pitch,
       tet_sphere_relate_dev, tet_sphere_relate_pitch);
+  ts_mark("kernel_relate");
 
-  // update tet_k = maximum number of related spheres per tet, computed on
-  // device: per-tet counts kernel + tiny (#tet ints) D2H + host max. The
-  // relation matrix itself stays on the GPU for fill_tet_knn_dev.
+  // Per-tet count of related spheres, computed on device: counts kernel + tiny
+  // (#tet ints) D2H. The relation matrix itself stays on the GPU for
+  // fill_tet_knn_csr_dev. tet_counts drives the CSR slot layout; tet_k (the
+  // max) is now reported only -- it no longer sizes anything, because charging
+  // EVERY tet the global maximum is what made the RPD buffer O(n_tet * max).
   int* counts_dev = nullptr;
   cudaMalloc((void**)&counts_dev, n_tet * sizeof(int));
   cuda_check_error();
@@ -325,21 +357,19 @@ void compute_tet_sphere_relation(
       tet_sphere_relate_dev, tet_sphere_relate_pitch, n_tet, n_site,
       counts_dev);
   cuda_check_error();
-  std::vector<int> counts(n_tet);
-  cudaMemcpy(counts.data(), counts_dev, n_tet * sizeof(int),
+  tet_counts.resize(n_tet);
+  cudaMemcpy(tet_counts.data(), counts_dev, n_tet * sizeof(int),
              cudaMemcpyDeviceToHost);
   cuda_check_error();
   cudaFree(counts_dev);
   tet_k = 0;
   for (int tid = 0; tid < n_tet; tid++)
-    if (counts[tid] > tet_k) tet_k = counts[tid];
+    if (tet_counts[tid] > tet_k) tet_k = tet_counts[tid];
   printf("updated tet_k: %d\n", tet_k);
-
-  // Memory clean-up (the relation matrix is handed to the caller, which
-  // fills tet_knn on device and frees it)
-  cudaFree(tet_pdist_dev);
-  tet_sphere_relate_dev_out = tet_sphere_relate_dev;
-  tet_sphere_relate_pitch_out = tet_sphere_relate_pitch;
+  ts_mark("count+D2H+max");
+  // No clean-up: both matrices belong to the caller's device cache, which
+  // reuses them across calls and releases them in cleanup_voronoi_gpu_cache()
+  // at the end of the particle stage.
 }
 
 void copy_tet_data(const std::vector<float>& vertices,
@@ -555,8 +585,9 @@ struct VoroDevCache {
 
   // per-call work buffers (grow-only)
   Buf voronoi_cells, cell_vol, site_weights, site_flags, convex_cells,
-      cell_bary_sum_lin, cc_flags, cc_pos, cc_compact;
-  PitchBuf cell_bary_sum, site_transposed, site_knn, tet_knn;
+      cell_bary_sum_lin, cc_flags, cc_pos, cc_compact, tet_offsets,
+      tet_knn_csr, slot2tet;
+  PitchBuf cell_bary_sum, site_transposed, site_knn, tet_pdist, tet_relate;
 
   // Free every device buffer and reset to pristine state. A subsequent
   // compute_clipped_voro_diagram_GPU() re-allocates on demand and re-uploads
@@ -598,10 +629,14 @@ struct VoroDevCache {
     freeBuf(cc_flags);
     freeBuf(cc_pos);
     freeBuf(cc_compact);
+    freeBuf(tet_offsets);
+    freeBuf(tet_knn_csr);
+    freeBuf(slot2tet);
     freePitch(cell_bary_sum);
     freePitch(site_transposed);
     freePitch(site_knn);
-    freePitch(tet_knn);
+    freePitch(tet_pdist);
+    freePitch(tet_relate);
   }
 };
 VoroDevCache g_voro;
@@ -751,30 +786,64 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   //////////////////////////////
   // Tet-Sphere
   int tet_k = -1;
-  int* tet_knn_dev = nullptr;
-  size_t tet_knn_pitch, tet_knn_pitch_in_bytes;
+  int n_slots_used = 0;  // total (tet, related sphere) pairs = CSR size
+  int* tet_knn_csr_dev = nullptr;
+  int* slot2tet_dev = nullptr;
   {
-    // update tet_k on device; the relation matrix stays on the GPU
-    int* tet_sphere_relate_dev = nullptr;
-    size_t tet_sphere_relate_pitch = 0;
+    // per-tet counts on device; the relation matrix stays on the GPU.
+    // Both big scratch matrices come from the grow-only cache (see
+    // compute_tet_sphere_relation) instead of being re-allocated per call.
+    const size_t tet_pdist_pitch =
+        g_voro.ensure_pitch(g_voro.tet_pdist, n_vert * sizeof(float), n_site) /
+        sizeof(float);
+    const size_t tet_sphere_relate_pitch =
+        g_voro.ensure_pitch(g_voro.tet_relate, n_tet * sizeof(int), n_site) /
+        sizeof(int);
+    int* tet_sphere_relate_dev = (int*)g_voro.tet_relate.p;
+    std::vector<int> tet_counts;
     compute_tet_sphere_relation(
         vert_dev, n_vert, vert_pitch, idx_dev, n_tet, idx_pitch,
         site_transposed_dev, site_flags_dev, n_site, site_pitch,
         site_weights_dev, site_knn_dev, site_k, site_knn_pitch,
-        tet_sphere_relate_dev, tet_sphere_relate_pitch, tet_k);
+        (float*)g_voro.tet_pdist.p, tet_pdist_pitch, tet_sphere_relate_dev,
+        tet_sphere_relate_pitch, tet_k, tet_counts);
 
-    // reuse persistent tet_knn buffer (grow-only)
-    tet_knn_pitch_in_bytes =
-        g_voro.ensure_pitch(g_voro.tet_knn, n_tet * sizeof(int), tet_k);
-    tet_knn_dev = (int*)g_voro.tet_knn.p;
-    tet_knn_pitch = tet_knn_pitch_in_bytes / sizeof(int);
-    // fill tet_knn directly on device (ascending sid per tet = the exact
-    // content the old host loop + cudaMemcpy2D produced)
-    fill_tet_knn_dev<<<(n_tet + 255) / 256, 256>>>(
-        tet_sphere_relate_dev, tet_sphere_relate_pitch, n_tet, n_site, tet_k,
-        tet_knn_pitch, tet_knn_dev);
+    // exclusive scan of the per-tet counts -> CSR offsets. Host-side: the
+    // counts are already resident here (one small D2H inside the call above)
+    // and n_tet ints is nothing next to the buffers this sizes.
+    std::vector<int> offsets(n_tet + 1);
+    {
+      int acc = 0;
+      for (int tid = 0; tid < n_tet; ++tid) {
+        offsets[tid] = acc;
+        acc += tet_counts[tid];
+      }
+      offsets[n_tet] = acc;
+      n_slots_used = acc;
+    }
+    printf("RPD slots: %d (CSR) vs %lld (dense n_tet*tet_k), %.1f%% of dense\n",
+           n_slots_used, (long long)n_tet * tet_k,
+           100.0 * n_slots_used / ((double)n_tet * (tet_k > 0 ? tet_k : 1)));
+
+    int* tet_offsets_dev = (int*)g_voro.ensure(g_voro.tet_offsets,
+                                               (size_t)(n_tet + 1) * sizeof(int));
+    cudaMemcpy(tet_offsets_dev, offsets.data(),
+               (size_t)(n_tet + 1) * sizeof(int), cudaMemcpyHostToDevice);
     cuda_check_error();
-    cudaFree(tet_sphere_relate_dev);
+    // n_slots_used can be 0 (no tet relates to any sphere); ensure() with 0
+    // bytes would hand back a null pointer, so floor the allocation at one
+    // element -- the kernel reads nothing in that case anyway.
+    const size_t slot_bytes = (size_t)(n_slots_used > 0 ? n_slots_used : 1) *
+                              sizeof(int);
+    tet_knn_csr_dev = (int*)g_voro.ensure(g_voro.tet_knn_csr, slot_bytes);
+    slot2tet_dev = (int*)g_voro.ensure(g_voro.slot2tet, slot_bytes);
+    // fill the CSR directly on device (ascending sid per tet = the exact
+    // content, and the exact per-tet order, the dense layout produced)
+    fill_tet_knn_csr_dev<<<(n_tet + 255) / 256, 256>>>(
+        tet_sphere_relate_dev, tet_sphere_relate_pitch, n_tet, n_site,
+        tet_offsets_dev, tet_knn_csr_dev, slot2tet_dev);
+    cuda_check_error();
+    // tet_sphere_relate_dev belongs to g_voro.tet_relate -- not freed here.
   }
   // // ninwang: debug
   // // copy knn back to host
@@ -820,8 +889,9 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   // Each thread compute a ConvexCell defined by
   // one tet and one nearby seed.
   //
-  // Note: will be updated later by tet_k
-  int n_grids = n_tet * tet_k / VORO_BLOCK_SIZE + 1;
+  // One thread per CSR slot, i.e. per (tet, related sphere) pair that actually
+  // exists -- not per (tet, max-over-all-tets) pair.
+  int n_grids = n_slots_used / VORO_BLOCK_SIZE + 1;
   int n_blocks = VORO_BLOCK_SIZE;
 
   // allocate more, after tet_k been updated
@@ -832,8 +902,9 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
       g_voro.convex_cells,
       (size_t)n_grids * n_blocks * sizeof(ConvexCellTransfer));
 
-  // allocate memory for stats
-  std::vector<Status> stat(n_tet * tet_k, security_radius_not_reached);
+  // allocate memory for stats (one per launched thread)
+  std::vector<Status> stat((size_t)n_grids * n_blocks,
+                           security_radius_not_reached);
   GPUBuffer<Status> gpu_stat(stat);
 
   {  // GPU voro kernel only
@@ -851,7 +922,7 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
         site_flags_dev, site_knn_dev, site_knn_pitch, site_k, vert_dev, n_vert,
         vert_pitch, idx_dev, n_tet, idx_pitch, v_adjs_dev, e_adj_offsets_dev,
         e_adj_neighbors_dev, e_adj_vals_dev, f_adjs_dev, f_ids_dev,
-        tet_knn_dev, tet_knn_pitch, tet_k,
+        tet_knn_csr_dev, slot2tet_dev, n_slots_used,
         gpu_stat.gpu_data, voronoi_cells_dev, convex_cells_dev,
         cell_bary_sum_dev, cell_bary_sum_pitch, cell_vol_dev);
     cuda_check_error();
