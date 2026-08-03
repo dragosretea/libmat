@@ -118,8 +118,9 @@ __device__ ConvexCell::ConvexCell(
     const float* p_weights, const uint* p_flags, Status* p_status,
     const int tid, const float* vert /*tet vertices*/, const int n_vert,
     const size_t vert_pitch, const int* idx /*tet indices*/,
-    const size_t idx_pitch, const int* v_adjs, const int* e_adjs,
-    const int* f_adjs, const int* f_ids)
+    const size_t idx_pitch, const int* v_adjs, const int* e_adj_offsets,
+    const int* e_adj_neighbors, const int* e_adj_vals, const int* f_adjs,
+    const int* f_ids)
     : pts_pitch(pitch), pts(p_pts), pts_weights(p_weights) {
   first_boundary_ = END_OF_LIST;
   FOR(i, _MAX_P_) boundary_next(i) = END_OF_LIST;
@@ -196,7 +197,7 @@ __device__ ConvexCell::ConvexCell(
       int v1 = idx[tid + (lv1 * idx_pitch)];
       int v2 = idx[tid + (lv2 * idx_pitch)];
       assert(v1 < n_vert && v2 < n_vert);
-      int e_adj = get_e_adj(e_adjs, n_vert, v1, v2);
+      int e_adj = get_e_adj(e_adj_offsets, e_adj_neighbors, e_adj_vals, v1, v2);
       assert(e_adj != UNK_INT);
       // e.g. vertices (0,1) share faces/clip (1,2)
       if (lv1 == 0 && lv2 == 1) edge(nb_e) = make_uchar3(2, 3, e_adj);
@@ -1168,11 +1169,12 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
     const float* site_weights, const uint* site_flags, const int* site_knn,
     const size_t site_knn_pitch, const int site_k, const float* vert,
     const int n_vert, const size_t vert_pitch, const int* idx, const int n_tet,
-    const size_t idx_pitch, const int* v_adjs, const int* e_adjs,
-    const int* f_adjs, const int* f_ids, const int* tet_knn,
-    const size_t tet_knn_pitch, const int tet_k, Status* gpu_stat,
-    VoronoiCell* voronoi_cells, ConvexCellTransfer* convex_cells_dev,
-    float* cell_bary_sum, const size_t cell_bary_sum_pitch, float* cell_vol) {
+    const size_t idx_pitch, const int* v_adjs, const int* e_adj_offsets,
+    const int* e_adj_neighbors, const int* e_adj_vals, const int* f_adjs,
+    const int* f_ids, const int* tet_knn, const size_t tet_knn_pitch,
+    const int tet_k, Status* gpu_stat, VoronoiCell* voronoi_cells,
+    ConvexCellTransfer* convex_cells_dev, float* cell_bary_sum,
+    const size_t cell_bary_sum_pitch, float* cell_vol) {
   bool is_debug = false;
   FOR(i, n_vert) { assert(v_adjs[i] > 0); }
 
@@ -1209,7 +1211,8 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
   // if (tid == 4 && seed == 4) is_debug = true;
   ConvexCell cc(seed, site, site_pitch, site_weights, site_flags,
                 &(gpu_stat[thread]), tid, vert, n_vert, vert_pitch, idx,
-                idx_pitch, v_adjs, e_adjs, f_adjs, f_ids);
+                idx_pitch, v_adjs, e_adj_offsets, e_adj_neighbors, e_adj_vals,
+                f_adjs, f_ids);
 
   if (is_debug) {
     printf("[clipped] processing tid: %d, seed: %d\n", tid, seed);

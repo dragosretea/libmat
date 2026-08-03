@@ -397,17 +397,18 @@ void copy_tet_data(const std::vector<float>& vertices,
  * Face Eulers (originally from tets) are always 1/2 (adjacent to 2 cells)
  * except boundary
  */
-void load_num_adjacent_cells_and_ids(const std::vector<int>& v_adjs,
-                                     const std::vector<int>& e_adjs,
-                                     const std::vector<int>& f_adjs,
-                                     const std::vector<int>& f_ids,
-                                     int*& v_adjs_dev, int*& e_adjs_dev,
-                                     int*& f_adjs_dev, int*& f_ids_dev) {
-  assert(!v_adjs.empty() && !e_adjs.empty() && !f_adjs.empty() &&
+void load_num_adjacent_cells_and_ids(
+    const std::vector<int>& v_adjs, const std::vector<int>& e_adj_offsets,
+    const std::vector<int>& e_adj_neighbors,
+    const std::vector<int>& e_adj_vals, const std::vector<int>& f_adjs,
+    const std::vector<int>& f_ids, int*& v_adjs_dev, int*& e_adj_offsets_dev,
+    int*& e_adj_neighbors_dev, int*& e_adj_vals_dev, int*& f_adjs_dev,
+    int*& f_ids_dev) {
+  assert(!v_adjs.empty() && !e_adj_neighbors.empty() && !f_adjs.empty() &&
          !f_ids.empty());
   std::cout << "loaded #adjacent cells for v: " << v_adjs.size()
-            << ", and e: " << e_adjs.size() << ", and f " << f_adjs.size()
-            << std::endl;
+            << ", and e: " << e_adj_neighbors.size() << ", and f "
+            << f_adjs.size() << std::endl;
 
   // ninwang: cuda need a pointer to pointer
   cudaMalloc((void**)&v_adjs_dev, v_adjs.size() * sizeof(int));
@@ -416,10 +417,23 @@ void load_num_adjacent_cells_and_ids(const std::vector<int>& v_adjs,
              cudaMemcpyHostToDevice);
   cuda_check_error();
 
-  cudaMalloc((void**)&e_adjs_dev, e_adjs.size() * sizeof(int));
+  cudaMalloc((void**)&e_adj_offsets_dev, e_adj_offsets.size() * sizeof(int));
   cuda_check_error();
-  cudaMemcpy(e_adjs_dev, e_adjs.data(), e_adjs.size() * sizeof(int),
-             cudaMemcpyHostToDevice);
+  cudaMemcpy(e_adj_offsets_dev, e_adj_offsets.data(),
+             e_adj_offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+  cuda_check_error();
+
+  cudaMalloc((void**)&e_adj_neighbors_dev,
+             e_adj_neighbors.size() * sizeof(int));
+  cuda_check_error();
+  cudaMemcpy(e_adj_neighbors_dev, e_adj_neighbors.data(),
+             e_adj_neighbors.size() * sizeof(int), cudaMemcpyHostToDevice);
+  cuda_check_error();
+
+  cudaMalloc((void**)&e_adj_vals_dev, e_adj_vals.size() * sizeof(int));
+  cuda_check_error();
+  cudaMemcpy(e_adj_vals_dev, e_adj_vals.data(),
+             e_adj_vals.size() * sizeof(int), cudaMemcpyHostToDevice);
   cuda_check_error();
 
   cudaMalloc((void**)&f_adjs_dev, f_adjs.size() * sizeof(int));
@@ -533,7 +547,9 @@ struct VoroDevCache {
   int* idx_dev = nullptr;
   size_t vert_pitch = 0, idx_pitch = 0;  // in elements
   int* v_adjs_dev = nullptr;
-  int* e_adjs_dev = nullptr;
+  int* e_adj_offsets_dev = nullptr;
+  int* e_adj_neighbors_dev = nullptr;
+  int* e_adj_vals_dev = nullptr;
   int* f_adjs_dev = nullptr;
   int* f_ids_dev = nullptr;
 
@@ -562,12 +578,15 @@ struct VoroDevCache {
     if (vert_dev) cudaFree(vert_dev);
     if (idx_dev) cudaFree(idx_dev);
     if (v_adjs_dev) cudaFree(v_adjs_dev);
-    if (e_adjs_dev) cudaFree(e_adjs_dev);
+    if (e_adj_offsets_dev) cudaFree(e_adj_offsets_dev);
+    if (e_adj_neighbors_dev) cudaFree(e_adj_neighbors_dev);
+    if (e_adj_vals_dev) cudaFree(e_adj_vals_dev);
     if (f_adjs_dev) cudaFree(f_adjs_dev);
     if (f_ids_dev) cudaFree(f_ids_dev);
     vert_dev = nullptr;
     idx_dev = nullptr;
-    v_adjs_dev = e_adjs_dev = f_adjs_dev = f_ids_dev = nullptr;
+    v_adjs_dev = e_adj_offsets_dev = e_adj_neighbors_dev = e_adj_vals_dev =
+        f_adjs_dev = f_ids_dev = nullptr;
     vert_pitch = idx_pitch = 0;
     cached_n_vert = cached_n_tet = -1;
     freeBuf(voronoi_cells);
@@ -593,7 +612,8 @@ void cleanup_voronoi_gpu_cache() { g_voro.free_all(); }
 std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     const int num_itr_global, const std::vector<float>& vertices,
     const std::vector<int>& indices, const std::map<int, std::set<int>>& v2tets,
-    const std::vector<int>& v_adjs, const std::vector<int>& e_adjs,
+    const std::vector<int>& v_adjs, const std::vector<int>& e_adj_offsets,
+    const std::vector<int>& e_adj_neighbors, const std::vector<int>& e_adj_vals,
     const std::vector<int>& f_adjs, const std::vector<int>& f_ids,
     std::vector<float>& site, const int n_site,
     const std::vector<float>& site_weights, const std::vector<uint>& site_flags,
@@ -610,14 +630,17 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     if (g_voro.vert_dev) cudaFree(g_voro.vert_dev);
     if (g_voro.idx_dev) cudaFree(g_voro.idx_dev);
     if (g_voro.v_adjs_dev) cudaFree(g_voro.v_adjs_dev);
-    if (g_voro.e_adjs_dev) cudaFree(g_voro.e_adjs_dev);
+    if (g_voro.e_adj_offsets_dev) cudaFree(g_voro.e_adj_offsets_dev);
+    if (g_voro.e_adj_neighbors_dev) cudaFree(g_voro.e_adj_neighbors_dev);
+    if (g_voro.e_adj_vals_dev) cudaFree(g_voro.e_adj_vals_dev);
     if (g_voro.f_adjs_dev) cudaFree(g_voro.f_adjs_dev);
     if (g_voro.f_ids_dev) cudaFree(g_voro.f_ids_dev);
     copy_tet_data(vertices, indices, g_voro.vert_dev, g_voro.vert_pitch,
                   g_voro.idx_dev, g_voro.idx_pitch);
-    load_num_adjacent_cells_and_ids(v_adjs, e_adjs, f_adjs, f_ids,
-                                    g_voro.v_adjs_dev, g_voro.e_adjs_dev,
-                                    g_voro.f_adjs_dev, g_voro.f_ids_dev);
+    load_num_adjacent_cells_and_ids(
+        v_adjs, e_adj_offsets, e_adj_neighbors, e_adj_vals, f_adjs, f_ids,
+        g_voro.v_adjs_dev, g_voro.e_adj_offsets_dev, g_voro.e_adj_neighbors_dev,
+        g_voro.e_adj_vals_dev, g_voro.f_adjs_dev, g_voro.f_ids_dev);
     g_voro.cached_n_vert = n_vert;
     g_voro.cached_n_tet = n_tet;
   }
@@ -625,7 +648,9 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
   int* idx_dev = g_voro.idx_dev;
   size_t vert_pitch = g_voro.vert_pitch, idx_pitch = g_voro.idx_pitch;
   int* v_adjs_dev = g_voro.v_adjs_dev;
-  int* e_adjs_dev = g_voro.e_adjs_dev;
+  int* e_adj_offsets_dev = g_voro.e_adj_offsets_dev;
+  int* e_adj_neighbors_dev = g_voro.e_adj_neighbors_dev;
+  int* e_adj_vals_dev = g_voro.e_adj_vals_dev;
   int* f_adjs_dev = g_voro.f_adjs_dev;
   int* f_ids_dev = g_voro.f_ids_dev;
   assert(v_adjs.size() == n_vert);
@@ -824,8 +849,9 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     clipped_voro_cell_test_GPU_param_tet<<<n_grids, n_blocks>>>(
         site_transposed_dev, n_site, site_pitch, site_weights_dev,
         site_flags_dev, site_knn_dev, site_knn_pitch, site_k, vert_dev, n_vert,
-        vert_pitch, idx_dev, n_tet, idx_pitch, v_adjs_dev, e_adjs_dev,
-        f_adjs_dev, f_ids_dev, tet_knn_dev, tet_knn_pitch, tet_k,
+        vert_pitch, idx_dev, n_tet, idx_pitch, v_adjs_dev, e_adj_offsets_dev,
+        e_adj_neighbors_dev, e_adj_vals_dev, f_adjs_dev, f_ids_dev,
+        tet_knn_dev, tet_knn_pitch, tet_k,
         gpu_stat.gpu_data, voronoi_cells_dev, convex_cells_dev,
         cell_bary_sum_dev, cell_bary_sum_pitch, cell_vol_dev);
     cuda_check_error();

@@ -254,7 +254,9 @@ void load_tet_adj_info(const std::map<int, std::set<int>>& v2tets,
                        const std::vector<int>& tet_indices,
                        const std::map<int, std::set<int>>& tet_vs2sf_fids,
                        const int n_sf_facets, std::vector<int>& v_adjs,
-                       std::vector<int>& e_adjs, std::vector<int>& f_adjs,
+                       std::vector<int>& e_adj_offsets,
+                       std::vector<int>& e_adj_neighbors,
+                       std::vector<int>& e_adj_vals, std::vector<int>& f_adjs,
                        std::vector<int>& f_ids) {
   if (tet_vs2sf_fids.empty() || v2tets.empty()) {
     printf("tet_vs2sf_fids size: %ld, v2tets size %ld \n",
@@ -262,7 +264,9 @@ void load_tet_adj_info(const std::map<int, std::set<int>>& v2tets,
     assert(false);
   }
   v_adjs.clear();
-  e_adjs.clear();
+  e_adj_offsets.clear();
+  e_adj_neighbors.clear();
+  e_adj_vals.clear();
   f_adjs.clear();
   f_ids.clear();
   int nb_p = v2tets.size();
@@ -275,22 +279,43 @@ void load_tet_adj_info(const std::map<int, std::set<int>>& v2tets,
     v_adjs[v] = nb_vcells;
   }
 
-  // load #adjacent cells of edges
-  e_adjs.resize(nb_p * (1 + nb_p) / 2 + 1, UNK_INT);
+  // load #adjacent cells of edges: sparse, one entry per ACTUAL mesh edge
+  // (a tet mesh has O(V) edges, not O(V^2) -- the old dense triangular array
+  // sized nb_p*(nb_p+1)/2 blew up to multi-GB and OOM'd the GPU on denser
+  // parts, e.g. 34k tet vertices -> 578M entries). Bucket by vmin, keep each
+  // bucket sorted by vmax (std::map already iterates in key order) so the
+  // GPU-side lookup (get_e_adj) can binary-search it.
   std::set<int> neigh_cells;
-  for (uint t = 0; t < nb_v; t++) {
-    // 6 edges of a tet
-    for (uint lv = 0; lv < 4; lv++) {
-      for (uint lv_next = lv + 1; lv_next < 4; lv_next++) {
-        int v1 = tet_indices[t * 4 + lv];
-        int v2 = tet_indices[t * 4 + lv_next];
-        int eid = get_edge_idx_copy(v1, v2, nb_p);
-        if (e_adjs[eid] != UNK_INT) continue;  // already stored
-        // check common cells of this edge
-        neigh_cells.clear();
-        set_intersection<int>(v2tets.at(v1), v2tets.at(v2), neigh_cells);
-        assert(!neigh_cells.empty());
-        e_adjs[eid] = neigh_cells.size();
+  {
+    std::vector<std::map<int, int>> per_vmin(nb_p);  // vmax -> #adjacent cells
+    for (uint t = 0; t < nb_v; t++) {
+      // 6 edges of a tet
+      for (uint lv = 0; lv < 4; lv++) {
+        for (uint lv_next = lv + 1; lv_next < 4; lv_next++) {
+          int v1 = tet_indices[t * 4 + lv];
+          int v2 = tet_indices[t * 4 + lv_next];
+          int vmin = std::min(v1, v2), vmax = std::max(v1, v2);
+          auto& bucket = per_vmin[vmin];
+          if (bucket.count(vmax)) continue;  // already stored
+          // check common cells of this edge
+          neigh_cells.clear();
+          set_intersection<int>(v2tets.at(v1), v2tets.at(v2), neigh_cells);
+          assert(!neigh_cells.empty());
+          bucket[vmax] = (int)neigh_cells.size();
+        }
+      }
+    }
+    e_adj_offsets.assign(nb_p + 1, 0);
+    for (int v = 0; v < nb_p; v++)
+      e_adj_offsets[v + 1] = e_adj_offsets[v] + (int)per_vmin[v].size();
+    e_adj_neighbors.resize(e_adj_offsets[nb_p]);
+    e_adj_vals.resize(e_adj_offsets[nb_p]);
+    for (int v = 0; v < nb_p; v++) {
+      int k = e_adj_offsets[v];
+      for (const auto& kv : per_vmin[v]) {  // std::map iterates sorted by key
+        e_adj_neighbors[k] = kv.first;
+        e_adj_vals[k] = kv.second;
+        ++k;
       }
     }
   }
@@ -346,7 +371,7 @@ void load_tet_adj_info(const std::map<int, std::set<int>>& v2tets,
   assert(f_ids.size() == tet_indices.size());  // each tet has 4 faces
 
   printf("loaded #adjacent cells for v: %d, and e: %d, and f %d\n",
-         v_adjs.size(), e_adjs.size(), f_adjs.size());
+         v_adjs.size(), e_adj_neighbors.size(), f_adjs.size());
 }
 
 void load_spheres_to_sites_given(std::vector<MedialSphere>& all_medial_spheres,

@@ -57,7 +57,8 @@ void cleanup_voronoi_gpu_cache();
 std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     const int num_itr_global, const std::vector<float>& vertices,
     const std::vector<int>& indices, const std::map<int, std::set<int>>& v2tets,
-    const std::vector<int>& v_adjs, const std::vector<int>& e_adjs,
+    const std::vector<int>& v_adjs, const std::vector<int>& e_adj_offsets,
+    const std::vector<int>& e_adj_neighbors, const std::vector<int>& e_adj_vals,
     const std::vector<int>& f_adjs, const std::vector<int>& f_ids,
     std::vector<float>& site, const int n_site,
     const std::vector<float>& site_weights, const std::vector<uint>& site_flags,

@@ -134,7 +134,14 @@ class TetMesh {
 
   // adjacent info, used for RPD and topo fix
   std::vector<int> v_adjs;
-  std::vector<int> e_adjs;
+  // Sparse (per-actual-edge) adjacency, replacing a dense V^2 array: bucketed
+  // by vmin = min(v1,v2), sorted ascending by vmax = max(v1,v2) within each
+  // bucket, so a lookup binary-searches e_adj_offsets[vmin]..[vmin+1] in
+  // e_adj_neighbors for vmax instead of indexing a dense O(V^2) table -- a tet
+  // mesh has O(V) edges, not O(V^2).
+  std::vector<int> e_adj_offsets;    // size nb_p + 1
+  std::vector<int> e_adj_neighbors;  // size = #edges, sorted per bucket
+  std::vector<int> e_adj_vals;       // size = #edges, aligned with e_adj_neighbors
   std::vector<int> f_adjs;
   std::vector<int> f_ids;  // store tet's face ids, each id is unique
 

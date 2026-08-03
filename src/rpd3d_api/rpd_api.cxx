@@ -112,15 +112,18 @@ void RPD3D_GPU::calculate() {
   //
   // site_flags: store (sphere_N + 1ring)
   // site:       store (sphere_N + 1ring + 2ring)
-  assert(!this->tet_mesh->v_adjs.empty() && !this->tet_mesh->e_adjs.empty() &&
+  assert(!this->tet_mesh->v_adjs.empty() &&
+         !this->tet_mesh->e_adj_neighbors.empty() &&
          !this->tet_mesh->f_adjs.empty() && !this->tet_mesh->f_ids.empty());
   std::vector<ConvexCellHost> cells_partials = compute_clipped_voro_diagram_GPU(
       this->num_itr_rpd, this->tet_mesh->tet_vertices,
       this->tet_mesh->tet_indices, this->tet_mesh->v2tets,
-      this->tet_mesh->v_adjs, this->tet_mesh->e_adjs, this->tet_mesh->f_adjs,
-      this->tet_mesh->f_ids, this->site, this->n_site, this->site_weights,
-      this->site_flags, this->site_knn, this->site_k, site_cell_vol,
-      site_is_transposed, 1 /*nb_iter*/, all_medial_spheres->size());
+      this->tet_mesh->v_adjs, this->tet_mesh->e_adj_offsets,
+      this->tet_mesh->e_adj_neighbors, this->tet_mesh->e_adj_vals,
+      this->tet_mesh->f_adjs, this->tet_mesh->f_ids, this->site, this->n_site,
+      this->site_weights, this->site_flags, this->site_knn, this->site_k,
+      site_cell_vol, site_is_transposed, 1 /*nb_iter*/,
+      all_medial_spheres->size());
   if (is_debug) printf("compute compute_clipped_voro_diagram_GPU done \n");
 
   // update cells_partials:
@@ -269,16 +272,18 @@ void RPD3D_GPU::calculate_partial(int& num_itr_global, int& num_sphere_added,
   //
   // site_flags: store (sphere_N + 1ring)
   // site:       store (sphere_N + 1ring + 2ring)
-  assert(!this->tet_mesh->v_adjs.empty() && !this->tet_mesh->e_adjs.empty() &&
+  assert(!this->tet_mesh->v_adjs.empty() &&
+         !this->tet_mesh->e_adj_neighbors.empty() &&
          !this->tet_mesh->f_adjs.empty() && !this->tet_mesh->f_ids.empty());
   assert(partial_tet_indices.size() == partial_tet_fids.size());
   std::vector<ConvexCellHost> cells_partials = compute_clipped_voro_diagram_GPU(
       num_itr_global, this->tet_mesh->tet_vertices, partial_tet_indices,
-      this->tet_mesh->v2tets, this->tet_mesh->v_adjs, this->tet_mesh->e_adjs,
-      partial_tet_f_adjs, partial_tet_fids, this->site, this->n_site,
-      this->site_weights, this->site_flags, this->site_knn, this->site_k,
-      site_cell_vol, site_is_transposed, 1 /*nb_iter*/,
-      all_medial_spheres->size());
+      this->tet_mesh->v2tets, this->tet_mesh->v_adjs,
+      this->tet_mesh->e_adj_offsets, this->tet_mesh->e_adj_neighbors,
+      this->tet_mesh->e_adj_vals, partial_tet_f_adjs, partial_tet_fids,
+      this->site, this->n_site, this->site_weights, this->site_flags,
+      this->site_knn, this->site_k, site_cell_vol, site_is_transposed,
+      1 /*nb_iter*/, all_medial_spheres->size());
 
   if (is_debug) printf("compute compute_clipped_voro_diagram_GPU done \n");
   if (is_debug)

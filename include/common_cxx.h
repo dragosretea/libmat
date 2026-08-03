@@ -148,22 +148,6 @@ constexpr int tet_vs_lfid_host[4][3] = {
 constexpr int tet_edges_lfid_host[6][2] = {{0, 1}, {0, 2}, {0, 3},
                                            {1, 2}, {1, 3}, {2, 3}};
 
-// keep the same code as get_edge_idx() in convex_cell.h
-inline int get_edge_idx_copy(int v1, int v2, int n) {
-  int vmin = v1;
-  int vmax = v2;
-  if (v1 > v2) {
-    vmin = v2;
-    vmax = v1;
-  }
-  int idx = 0;
-  for (uint j = 0; j <= vmin; j++) {
-    idx += (n - j);
-  }
-  idx -= (n - vmax);
-  return idx;
-}
-
 //----------------------------------------------------------------------------
 
 template <typename T>

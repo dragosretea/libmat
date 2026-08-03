@@ -35,34 +35,29 @@ __constant__ int tet_edges_lvid[6][2] = {{2, 3}, {1, 3}, {1, 2},
 
 // For orignal tet mesh
 //
-// Edge Eulers are stored as a diagonal adjacency matrix with size n
-// given two sorted vertex indices (vmin, vmax), we can get
-// the index for this edge
-//
-// Edge e -> (vid_min, vid_max)
-// n -> #vertices
-// idx(e) = idx(vid_min, vid_max)
-//             = n + (n-1) + ... + (n-vid_min) - (n - vid_max)
-inline __host__ __device__ int get_edge_idx(int v1, int v2, int n) {
-  int vmin = v1;
-  int vmax = v2;
-  if (v1 > v2) {
-    vmin = v2;
-    vmax = v1;
+// Edge Eulers, sparse: one entry per ACTUAL mesh edge (a tet mesh has O(V)
+// edges, not O(V^2) -- a dense triangular array over every vertex PAIR blew
+// up to multi-GB and OOM'd the GPU on denser parts). Bucketed by
+// vmin = min(v1,v2); e_adj_offsets[vmin]..[vmin+1] indexes the bucket in
+// e_adj_neighbors, sorted ascending by vmax = max(v1,v2), so the lookup is a
+// binary search over that (small, O(vertex valence)) row instead of a dense
+// index.
+inline __host__ __device__ int get_e_adj(const int* e_adj_offsets,
+                                         const int* e_adj_neighbors,
+                                         const int* e_adj_vals, const int v1,
+                                         const int v2) {
+  const int vmin = v1 < v2 ? v1 : v2;
+  const int vmax = v1 < v2 ? v2 : v1;
+  int lo = e_adj_offsets[vmin], hi = e_adj_offsets[vmin + 1];
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (e_adj_neighbors[mid] < vmax)
+      lo = mid + 1;
+    else
+      hi = mid;
   }
-  int idx = 0;
-  for (uint j = 0; j <= vmin; j++) {
-    idx += (n - j);
-  }
-  idx -= (n - vmax);
-  return idx;
-}
-inline __host__ __device__ int get_e_adj(const int* e_adjs, const int v_size,
-                                         const int v1, const int v2) {
-  int eid = get_edge_idx(v1, v2, v_size);
-  int edge_max = v_size * (1 + v_size) / 2 + 1;
-  assert(eid >= 0 && eid < edge_max);
-  return e_adjs[eid];
+  assert(lo < e_adj_offsets[vmin + 1] && e_adj_neighbors[lo] == vmax);
+  return e_adj_vals[lo];
 }
 
 // NOTE: #adjacent_cells are int!!
@@ -130,7 +125,9 @@ struct ConvexCell {
                         const float* vert, const int n_vert,
                         const size_t vert_pitch, const int* idx,
                         const size_t idx_pitch, const int* v_adjs,
-                        const int* e_adjs, const int* f_adjs, const int* f_ids);
+                        const int* e_adj_offsets, const int* e_adj_neighbors,
+                        const int* e_adj_vals, const int* f_adjs,
+                        const int* f_ids);
   __device__ void clip_by_plane(int neigh_seed_id);
   __device__ void clip_by_plane(float4 eqn);
   __device__ bool is_vertex_perturb(uchar3 v);
@@ -224,11 +221,12 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
     const uint* site_flags, const int* site_knn, const size_t site_knn_pitch,
     const int site_k, const float* vert, const int n_vert,
     const size_t vert_pitch, const int* idx, const int n_tet,
-    const size_t idx_pitch, const int* v_adjs, const int* e_adjs,
-    const int* f_adjs, const int* f_ids, const int* tet_knn,
-    const size_t tet_knn_pitch, const int tet_k, Status* gpu_stat,
-    VoronoiCell* voronoi_cells, ConvexCellTransfer* convex_cells_dev,
-    float* cell_bary_sum, const size_t cell_bary_sum_pitch, float* cell_vol);
+    const size_t idx_pitch, const int* v_adjs, const int* e_adj_offsets,
+    const int* e_adj_neighbors, const int* e_adj_vals, const int* f_adjs,
+    const int* f_ids, const int* tet_knn, const size_t tet_knn_pitch,
+    const int tet_k, Status* gpu_stat, VoronoiCell* voronoi_cells,
+    ConvexCellTransfer* convex_cells_dev, float* cell_bary_sum,
+    const size_t cell_bary_sum_pitch, float* cell_vol);
 
 __global__ void clipped_voro_cell_test_GPU_param(
     float* vert, int n_vert, size_t vert_pitch, int* idx, int n_tet,
