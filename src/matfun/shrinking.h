@@ -55,13 +55,21 @@ void insert_spheres_for_concave_lines_new(
     std::vector<FeatureLine> &ce_lines,
     std::vector<MedialSphere> &all_medial_spheres,
     const double cc_len_eps /*=length, scaled in [0, Parameter::scale_max]*/,
-    bool is_debug);
+    // MSD_CC_NORMAL_EPS: degrees between two sampled directions of the
+    // tangency fan at ONE pin point. <= 0 keeps the historical behaviour
+    // (a single random normal per pin).
+    const double cc_normal_eps, bool is_debug);
 
 bool update_new_concave_sphere(const SurfaceMesh &sf_mesh,
                                const std::vector<FeatureEdge> &feature_edges,
                                const Vector3 &pin_point, const int fe_id,
                                const int sphere_type, MedialSphere &new_sphere,
-                               bool is_debug);
+                               bool is_debug,
+                               // MSD_CC_NORMAL_EPS: when non-null, USE this
+                               // normal instead of drawing a random one from
+                               // the tangency fan (see
+                               // insert_new_spheres_given_pin_sample).
+                               const Vector3 *new_normal_in = nullptr);
 
 bool update_msphere_given_v2fid(const SurfaceMesh &sf_mesh,
                                 const TetMesh &tet_mesh,

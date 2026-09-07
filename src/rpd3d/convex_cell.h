@@ -109,6 +109,12 @@ inline __device__ int2 clip_id2(int p) {
   return make_int2(__float2int_rn(clip(p).g), __float2int_rn(clip(p).k));
 }
 
+// MSD_SPH_ANISO: per-thread register scratch for one site's real-SH basis.
+// (L+1)^2 floats, so 16 covers bands up to L=3 -- which is the cap the ladder
+// and the L=2-vs-L=3 comparison need. site_weight_along() refuses (and falls
+// back to the scalar weight) rather than overflow if a site ever exceeds it.
+#define _MAX_SH_D_ 16
+
 struct ConvexCell {
   // no use
   __device__ ConvexCell(const int p_seed, const float* p_pts,
@@ -127,7 +133,11 @@ struct ConvexCell {
                         const size_t idx_pitch, const int* v_adjs,
                         const int* e_adj_offsets, const int* e_adj_neighbors,
                         const int* e_adj_vals, const int* f_adjs,
-                        const int* f_ids);
+                        const int* f_ids,
+                        // MSD_SPH_ANISO (default = the isotropic path,
+                        // bit-for-bit): per-site real-SH radius functions.
+                        const float* p_sh = nullptr, const int* p_shl = nullptr,
+                        const float* p_shnrm = nullptr, const int p_sh_stride = 0);
   __device__ void clip_by_plane(int neigh_seed_id);
   __device__ void clip_by_plane(float4 eqn);
   __device__ bool is_vertex_perturb(uchar3 v);
@@ -135,6 +145,14 @@ struct ConvexCell {
                                                bool persp_divide = true) const;
   __device__ inline uchar& ith_plane(uchar t, int i);
   // halfplane, defined by neigh_seed_id and voro_id
+  // MSD_SPH_ANISO: site `idx`'s power weight along the direction (dx,dy,dz),
+  // which points FROM site idx TOWARD the other site of the pair. Returns
+  // r_idx(u)^2, or the stored scalar weight (r_max^2) when the site is
+  // isotropic. Evaluating each site along its own outgoing direction makes the
+  // pair weights a function of the PAIR alone, so the two cells of a face emit
+  // exactly negated half-spaces and the diagram still tiles.
+  __device__ float site_weight_along(int idx, float dx, float dy,
+                                     float dz) const;
   __device__ int new_plane(int neigh_seed_id);
   __device__ int new_plane(float4 eqn);
   __device__ int find_edge_id(uchar clip1, uchar clip2);
@@ -167,6 +185,12 @@ struct ConvexCell {
   const float* pts = nullptr;  // for storing all sites
   const size_t pts_pitch = 0;
   const float* pts_weights = nullptr;  // for storing site weights (sq_radius)
+  // MSD_SPH_ANISO. sh_stride == 0 (the default) disables every SH path and the
+  // kernel is byte-identical to the isotropic one.
+  const float* pts_sh = nullptr;     // n_site * sh_stride SH coefficients
+  const int* pts_shl = nullptr;      // per-site band, 0 = isotropic site
+  const float* pts_shnrm = nullptr;  // sh_stride norm table (realSH order)
+  int sh_stride = 0;
   int voro_id;       // may not matching MedialSphere::id in all_medial_spheres,
                      // if given partial spheres
   int tet_id;        // index of tet, to filter multiple seed&tet pairs
@@ -226,7 +250,10 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
     const int* f_ids, const int* tet_knn_csr, const int* slot2tet,
     const int n_slots, Status* gpu_stat, VoronoiCell* voronoi_cells,
     ConvexCellTransfer* convex_cells_dev, float* cell_bary_sum,
-    const size_t cell_bary_sum_pitch, float* cell_vol);
+    const size_t cell_bary_sum_pitch, float* cell_vol,
+    // MSD_SPH_ANISO; sh_stride == 0 => the isotropic kernel, unchanged.
+    const float* site_sh = nullptr, const int* site_shl = nullptr,
+    const float* site_shnrm = nullptr, const int sh_stride = 0);
 
 __global__ void clipped_voro_cell_test_GPU_param(
     float* vert, int n_vert, size_t vert_pitch, int* idx, int n_tet,

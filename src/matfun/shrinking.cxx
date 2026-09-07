@@ -654,13 +654,17 @@ bool update_new_concave_sphere(const SurfaceMesh& sf_mesh,
                                const std::vector<FeatureEdge>& feature_edges,
                                const Vector3& pin_point, const int fe_id,
                                const int sphere_type, MedialSphere& new_sphere,
-                               bool is_debug) {
+                               bool is_debug, const Vector3* new_normal_in) {
   assert(fe_id >= 0 && fe_id < feature_edges.size());
   // apply perturbation
   const FeatureEdge& one_fe = feature_edges.at(fe_id);
   const std::array<Vector3, 2>& adj_normals = one_fe.adj_normals;
+  // MSD_CC_NORMAL_EPS: a caller walking the tangency fan supplies the direction
+  // for this sphere, so the draw is skipped and the result is deterministic.
   Vector3 new_normal =
-      sample_random_vector_given_two_vectors(adj_normals[0], adj_normals[1]);
+      new_normal_in ? *new_normal_in
+                    : sample_random_vector_given_two_vectors(adj_normals[0],
+                                                             adj_normals[1]);
   // re-int the new sphere using new pin_point and new_normal
   new_sphere =
       MedialSphere(new_sphere.id, pin_point, new_normal, fe_id,
@@ -687,11 +691,12 @@ int insert_new_concave_sphere_given_pin(
     const SurfaceMesh& sf_mesh, const std::vector<FeatureEdge>& feature_edges,
     const Vector3& pin_point, const int fe_id,
     std::vector<MedialSphere>& all_medial_spheres, int sphere_type,
-    bool is_debug) {
+    bool is_debug, const Vector3* new_normal_in = nullptr) {
   // create new concave sphere
   MedialSphere new_sphere;
   if (!update_new_concave_sphere(sf_mesh, feature_edges, pin_point, fe_id,
-                                 sphere_type, new_sphere, is_debug))
+                                 sphere_type, new_sphere, is_debug,
+                                 new_normal_in))
     return -1;
 
   if (add_new_sphere_validate(all_medial_spheres, new_sphere)) {
@@ -727,31 +732,66 @@ int insert_new_concave_sphere_given_pin_wrapper(
   return new_sphere_id;
 }
 
-// For each given pin point, only sample 1 random normal.
+// Sample the tangency fan at ONE pin point (MSD_CC_NORMAL_EPS).
+//
+// RECONSTRUCTED 2026-09-07 after extern/libmat was destroyed by a `cmake .`
+// re-clone (extern/* is gitignored and download_project() hard-reset it;
+// guarded since in cmake/matstruct_downloadExternal.cmake). Recovered from the
+// pre-wipe objects in build2/build3 -- signatures via `nm -C`, the arithmetic
+// via `objdump -dr` on shrinking.cxx.o, which pins every constant used here:
+//   divsd; cvttsd2si; lea 0x1(%r12)   ->  n = (int)(angle / cc_normal_eps) + 1
+//   cmp $0x1; jle                     ->  n <= 1 takes the single-draw path
+//   lea 0x2(%r12); cvtsi2sd           ->  the divisor is (double)(n + 1)
+//   mov $0x1,%r15d; cvtsi2sd; divsd   ->  t = i / (n + 1), i from 1
+// and the relocations show the loop calling insert_new_concave_sphere_given_pin
+// DIRECTLY (a fixed normal makes the wrapper's 10 retries pointless) while the
+// n <= 1 branch calls the retrying wrapper. There is no rand() relocation in
+// the loop, so the fan is deterministic: the interpolation is the plain
+// lerp+normalise of sample_k_vectors_given_two_vectors_perturb()
+// (common_geogram.h) WITHOUT its random perturbation, and the lone `acos` is
+// angle_between_two_vectors_in_degrees below, not a slerp.
+//
+// cc_normal_eps <= 0 restores the historical single random normal per pin.
 int insert_new_spheres_given_pin_sample(
     const SurfaceMesh& sf_mesh, const std::vector<FeatureEdge>& feature_edges,
     const FL_Sample& pin_sample, const double cc_len_eps,
-    std::vector<MedialSphere>& all_medial_spheres, bool is_debug) {
+    const double cc_normal_eps, std::vector<MedialSphere>& all_medial_spheres,
+    bool is_debug) {
   const Vector3& pin = pin_sample.point;
   const FeatureEdge& one_fe = feature_edges.at(pin_sample.fe_id);
   const std::array<Vector3, 2>& adj_normals = one_fe.adj_normals;
   const double angle =
       angle_between_two_vectors_in_degrees(adj_normals[0], adj_normals[1]);
-  // int num_new_spheres = std::ceil(angle / cc_normal_eps) + 1;
-  // num_new_spheres = 1;
+  int num_new_spheres = 1;
+  if (cc_normal_eps > 0)
+    num_new_spheres = (int)(angle / cc_normal_eps) + 1;
 
   // Step 1: create new T_2_c spheres
-  // std::vector<Vector3> new_normals;  // size will be num_new_spheres
   std::vector<int> new_sphere_ids;
-  // for (int i = 0; i < num_new_spheres; i++) {
-  int new_sphere_id = insert_new_concave_sphere_given_pin_wrapper(
-      sf_mesh, feature_edges, pin, one_fe.id, all_medial_spheres,
-      0 /*SphereType::T_2_c*/, is_debug);
-  if (new_sphere_id != -1) new_sphere_ids.push_back(new_sphere_id);
+  if (num_new_spheres > 1) {
+    // t in {1/(n+1), ..., n/(n+1)}: n interior directions, both boundary
+    // normals skipped (a sphere tangent to one face only is the isotropic case
+    // the pin already covers).
+    const double denom = (double)(num_new_spheres + 1);
+    for (int i = 1; i <= num_new_spheres; i++) {
+      const double t = (double)i / denom;
+      const Vector3 nX =
+          GEO::normalize((1. - t) * adj_normals[0] + t * adj_normals[1]);
+      int new_sphere_id = insert_new_concave_sphere_given_pin(
+          sf_mesh, feature_edges, pin, one_fe.id, all_medial_spheres,
+          0 /*SphereType::T_2_c*/, is_debug, &nX);
+      if (new_sphere_id != -1) new_sphere_ids.push_back(new_sphere_id);
+    }
+  } else {
+    int new_sphere_id = insert_new_concave_sphere_given_pin_wrapper(
+        sf_mesh, feature_edges, pin, one_fe.id, all_medial_spheres,
+        0 /*SphereType::T_2_c*/, is_debug);
+    if (new_sphere_id != -1) new_sphere_ids.push_back(new_sphere_id);
+  }
 
   if (is_debug)
-    printf("[CC Sphere] cc_line %d created new cc sphere: %ld \n", one_fe.id,
-           new_sphere_ids.size());
+    printf("[CC Sphere] cc_line %d created %ld new cc spheres (fan %d) \n",
+           one_fe.id, new_sphere_ids.size(), num_new_spheres);
   return new_sphere_ids.size();
 }
 
@@ -773,9 +813,11 @@ void insert_spheres_for_concave_lines_new(
     std::vector<FeatureLine>& ce_lines,
     std::vector<MedialSphere>& all_medial_spheres,
     const double cc_len_eps /*=length, scaled in [0, Parameter::scale_max]*/,
-    bool is_debug) {
+    const double cc_normal_eps, bool is_debug) {
   // store if two end points of given one_cc_line is visited as pin
-  if (is_debug) printf("[CC Sphere] cc_len_eps: %f\n", cc_len_eps);
+  if (is_debug)
+    printf("[CC Sphere] cc_len_eps: %f cc_normal_eps: %f\n", cc_len_eps,
+           cc_normal_eps);
 
   // 1. for concave lines
   int num_sphere = all_medial_spheres.size();
@@ -785,8 +827,8 @@ void insert_spheres_for_concave_lines_new(
     // create new spheres given samples on CE
     for (const auto& pin_sample : one_ce_line.samples) {
       insert_new_spheres_given_pin_sample(sf_mesh, feature_edges, pin_sample,
-                                          cc_len_eps, all_medial_spheres,
-                                          is_debug);
+                                          cc_len_eps, cc_normal_eps,
+                                          all_medial_spheres, is_debug);
     }
   }
   // if (is_debug)

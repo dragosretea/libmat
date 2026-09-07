@@ -64,6 +64,15 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     const std::vector<float>& site_weights, const std::vector<uint>& site_flags,
     const std::vector<int>& site_knn, const int site_k,
     std::vector<float>& site_cell_vol, const bool site_is_transposed,
-    int nb_Lloyd_iter = 1, int preferred_tet_k = 0);
+    int nb_Lloyd_iter = 1, int preferred_tet_k = 0,
+    // MSD_SPH_ANISO -- per-site real-SH radius functions (see
+    // RPD3D_GPU::sph_*). All defaults => the isotropic diagram, unchanged.
+    // sph_coeffs: n_site * sph_stride, sph_l: n_site, sph_nrm: sph_stride.
+    const std::vector<float>* sph_coeffs = nullptr,
+    const std::vector<int>* sph_l = nullptr,
+    const std::vector<float>* sph_nrm = nullptr, int sph_stride = 0,
+    // Global max (r_max^2 - r_min^2); widens the tet<->sphere relation so an
+    // anisotropic pair is not rejected before any cell exists.
+    float sph_gap = 0.f);
 
 #endif  // __VORONOI_H__

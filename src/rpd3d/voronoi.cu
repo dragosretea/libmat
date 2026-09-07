@@ -158,7 +158,8 @@ __global__ void tet_sphere_relations_dev(
     const size_t idx_pitch, const int n_site, const uint* site_flags_dev,
     const int* site_knn_dev, const size_t site_knn_pitch, const int site_k,
     const float* pdist_dev, const size_t pdist_pitch,
-    int* tet_sphere_relate_dev, size_t tet_sphere_relate_pitch) {
+    int* tet_sphere_relate_dev, size_t tet_sphere_relate_pitch,
+    const float sph_gap) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= n_tet) return;
 
@@ -195,7 +196,14 @@ __global__ void tet_sphere_relations_dev(
       bool any_closer = false;
       FOR(t, 4) {
         // tet vertex v_ids[t] closer to sphere i than j
-        if (pdist_dev[v_ids[t] + sm_idx * pdist_pitch] > pd_i[t]) {
+        // MSD_SPH_ANISO: the pdist matrix is built on the SCALAR weight
+        // r_max^2, but the anisotropic bisector can sit up to
+        // (r_max_j^2 - r_min_j^2) / (2 D_ij) away from where that puts it. Slack
+        // the NEIGHBOUR's distance by the global gap so a tet that an
+        // anisotropic sphere can still reach is not dropped from the relation
+        // before any cell exists -- which is why widening site_knn alone could
+        // not help. sph_gap == 0 restores the exact original comparison.
+        if (pdist_dev[v_ids[t] + sm_idx * pdist_pitch] + sph_gap > pd_i[t]) {
           any_closer = true;
           break;
         }
@@ -287,7 +295,7 @@ void compute_tet_sphere_relation(
     const int* site_knn_dev, const int site_k, const size_t site_knn_pitch,
     float* tet_pdist_dev, const size_t tet_pdist_pitch,
     int* tet_sphere_relate_dev, const size_t tet_sphere_relate_pitch,
-    int& tet_k, std::vector<int>& tet_counts) {
+    int& tet_k, std::vector<int>& tet_counts, const float sph_gap) {
   // printf("calling compute_tet_sphere_relation... \n");
 
   // Opt-in sub-attribution of this function (it is ~87% of the RPD phase on
@@ -342,7 +350,7 @@ void compute_tet_sphere_relation(
   tet_sphere_relations_dev<<<n_tet / VORO_BLOCK_SIZE + 1, VORO_BLOCK_SIZE>>>(
       n_vert, idx_dev, n_tet, idx_pitch, n_site, site_flags_dev, site_knn_dev,
       site_knn_pitch, site_k, tet_pdist_dev, tet_pdist_pitch,
-      tet_sphere_relate_dev, tet_sphere_relate_pitch);
+      tet_sphere_relate_dev, tet_sphere_relate_pitch, sph_gap);
   ts_mark("kernel_relate");
 
   // Per-tet count of related spheres, computed on device: counts kernel + tiny
@@ -587,6 +595,9 @@ struct VoroDevCache {
   Buf voronoi_cells, cell_vol, site_weights, site_flags, convex_cells,
       cell_bary_sum_lin, cc_flags, cc_pos, cc_compact, tet_offsets,
       tet_knn_csr, slot2tet;
+  // MSD_SPH_ANISO: uploaded beside site_weights, freed beside it. Grow-only
+  // like the rest, so an anisotropy-off run never allocates them.
+  Buf sph_coeffs, sph_l, sph_nrm;
   PitchBuf cell_bary_sum, site_transposed, site_knn, tet_pdist, tet_relate;
 
   // Free every device buffer and reset to pristine state. A subsequent
@@ -624,6 +635,9 @@ struct VoroDevCache {
     freeBuf(cell_vol);
     freeBuf(site_weights);
     freeBuf(site_flags);
+    freeBuf(sph_coeffs);
+    freeBuf(sph_l);
+    freeBuf(sph_nrm);
     freeBuf(convex_cells);
     freeBuf(cell_bary_sum_lin);
     freeBuf(cc_flags);
@@ -654,7 +668,9 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
     const std::vector<float>& site_weights, const std::vector<uint>& site_flags,
     const std::vector<int>& site_knn, const int site_k,
     std::vector<float>& site_cell_vol, const bool site_is_transposed,
-    int nb_Lloyd_iter, int preferred_tet_k) {
+    int nb_Lloyd_iter, int preferred_tet_k,
+    const std::vector<float>* sph_coeffs, const std::vector<int>* sph_l,
+    const std::vector<float>* sph_nrm, int sph_stride, float sph_gap) {
   cudaSetDevice(0);  // specify a device to be used for GPU computation
   int n_vert = vertices.size() / 3;
   int n_tet = (indices.size() >> 2);
@@ -719,6 +735,36 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
       (float*)g_voro.ensure(g_voro.site_weights, n_site * sizeof(float));
   cudaMemcpy(site_weights_dev, site_weights.data(), n_site * sizeof(float),
              cudaMemcpyHostToDevice);
+
+  // MSD_SPH_ANISO: the per-site radius functions, uploaded beside the scalar
+  // weights and bound at the launch below. Anything missing or short leaves
+  // sh_stride_dev == 0, and the kernel is then the isotropic one byte for byte.
+  const float* sph_coeffs_dev = nullptr;
+  const int* sph_l_dev = nullptr;
+  const float* sph_nrm_dev = nullptr;
+  int sh_stride_dev = 0;
+  if (sph_stride > 0 && sph_coeffs && sph_l && sph_nrm &&
+      (int)sph_l->size() >= n_site &&
+      (long long)sph_coeffs->size() >= (long long)n_site * sph_stride &&
+      (int)sph_nrm->size() >= sph_stride) {
+    sh_stride_dev = sph_stride;
+    float* c = (float*)g_voro.ensure(g_voro.sph_coeffs,
+                                     (size_t)n_site * sph_stride * sizeof(float));
+    int* l = (int*)g_voro.ensure(g_voro.sph_l, (size_t)n_site * sizeof(int));
+    float* nr =
+        (float*)g_voro.ensure(g_voro.sph_nrm, (size_t)sph_stride * sizeof(float));
+    cudaMemcpy(c, sph_coeffs->data(),
+               (size_t)n_site * sph_stride * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(l, sph_l->data(), (size_t)n_site * sizeof(int),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(nr, sph_nrm->data(), (size_t)sph_stride * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cuda_check_error();
+    sph_coeffs_dev = c;
+    sph_l_dev = l;
+    sph_nrm_dev = nr;
+  }
   cuda_check_error();
 
   // ninwang: allocate memory for site flag
@@ -806,7 +852,7 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
         site_transposed_dev, site_flags_dev, n_site, site_pitch,
         site_weights_dev, site_knn_dev, site_k, site_knn_pitch,
         (float*)g_voro.tet_pdist.p, tet_pdist_pitch, tet_sphere_relate_dev,
-        tet_sphere_relate_pitch, tet_k, tet_counts);
+        tet_sphere_relate_pitch, tet_k, tet_counts, sph_gap);
 
     // exclusive scan of the per-tet counts -> CSR offsets. Host-side: the
     // counts are already resident here (one small D2H inside the call above)
@@ -924,7 +970,8 @@ std::vector<ConvexCellHost> compute_clipped_voro_diagram_GPU(
         e_adj_neighbors_dev, e_adj_vals_dev, f_adjs_dev, f_ids_dev,
         tet_knn_csr_dev, slot2tet_dev, n_slots_used,
         gpu_stat.gpu_data, voronoi_cells_dev, convex_cells_dev,
-        cell_bary_sum_dev, cell_bary_sum_pitch, cell_vol_dev);
+        cell_bary_sum_dev, cell_bary_sum_pitch, cell_vol_dev, sph_coeffs_dev,
+        sph_l_dev, sph_nrm_dev, sh_stride_dev);
     cuda_check_error();
 
     cudaEventRecord(stop);

@@ -120,8 +120,15 @@ __device__ ConvexCell::ConvexCell(
     const size_t vert_pitch, const int* idx /*tet indices*/,
     const size_t idx_pitch, const int* v_adjs, const int* e_adj_offsets,
     const int* e_adj_neighbors, const int* e_adj_vals, const int* f_adjs,
-    const int* f_ids)
-    : pts_pitch(pitch), pts(p_pts), pts_weights(p_weights) {
+    const int* f_ids, const float* p_sh, const int* p_shl,
+    const float* p_shnrm, const int p_sh_stride)
+    : pts_pitch(pitch),
+      pts(p_pts),
+      pts_weights(p_weights),
+      pts_sh(p_sh),
+      pts_shl(p_shl),
+      pts_shnrm(p_shnrm),
+      sh_stride(p_sh_stride) {
   first_boundary_ = END_OF_LIST;
   FOR(i, _MAX_P_) boundary_next(i) = END_OF_LIST;
   voro_id = p_seed;
@@ -501,6 +508,102 @@ __device__ bool ConvexCell::cc_vertex_is_in_conflict_double(
 }
 
 // pts_weights stores sq_radii (defaults 1)
+// ---------------------------------------------------------------------------
+// MSD_SPH_ANISO. Device real-SH evaluator: a verbatim transcription of
+// devRealSH (MATStruct src/analytic/analytic_stamp_gpu.cu), which is the
+// canonical one already exercised by the shipped analytic stamp. It must stay
+// character-identical to it -- the host mirror hostSiteWeightAlong()
+// (ups_sph_loop.cpp) is what catches a divergence.
+// out index of (l,m) is l*(l+1)+m, matching spectral_basis.cpp; nrm[idx] is the
+// host-supplied shNorm(l,|m|) table.
+__device__ inline void devRealSH_cc(int L, float theta, float phi,
+                                    const float* nrm, float* out) {
+  const float ct = cosf(theta);
+  const float kSqrt2 = 1.41421356237309504880f;
+  for (int m = 0; m <= L; ++m) {
+    const float cm = m > 0 ? cosf(m * phi) : 0.0f;
+    const float sm = m > 0 ? sinf(m * phi) : 0.0f;
+    float pmm = 1.0f;
+    if (m > 0) {
+      const float somx2 = sqrtf((1.0f - ct) * (1.0f + ct));
+      float fact = 1.0f;
+      for (int i = 1; i <= m; ++i) {
+        pmm *= -fact * somx2;
+        fact += 2.0f;
+      }
+    }
+    {
+      const int l = m, i0 = l * (l + 1) + m;
+      if (m == 0) {
+        out[i0] = nrm[i0] * pmm;
+      } else {
+        out[i0] = kSqrt2 * nrm[i0] * pmm * cm;
+        out[l * (l + 1) - m] = kSqrt2 * nrm[l * (l + 1) - m] * pmm * sm;
+      }
+    }
+    if (m < L) {
+      float pmmp1 = ct * (2.0f * m + 1.0f) * pmm;
+      {
+        const int l = m + 1, i0 = l * (l + 1) + m;
+        if (m == 0) {
+          out[i0] = nrm[i0] * pmmp1;
+        } else {
+          out[i0] = kSqrt2 * nrm[i0] * pmmp1 * cm;
+          out[l * (l + 1) - m] = kSqrt2 * nrm[l * (l + 1) - m] * pmmp1 * sm;
+        }
+      }
+      float pprev = pmm, pcur = pmmp1;
+      for (int ll = m + 2; ll <= L; ++ll) {
+        const float pll =
+            ((2.0f * ll - 1.0f) * ct * pcur - (ll + m - 1.0f) * pprev) /
+            (ll - m);
+        pprev = pcur;
+        pcur = pll;
+        const int i0 = ll * (ll + 1) + m;
+        if (m == 0) {
+          out[i0] = nrm[i0] * pll;
+        } else {
+          out[i0] = kSqrt2 * nrm[i0] * pll * cm;
+          out[ll * (ll + 1) - m] = kSqrt2 * nrm[ll * (ll + 1) - m] * pll * sm;
+        }
+      }
+    }
+  }
+}
+
+// r_idx(u)^2 along u = normalize(dx,dy,dz), the direction from site idx toward
+// the other site of the pair. Falls back to the stored scalar weight whenever
+// anisotropy is off, the site is isotropic, the direction is degenerate, or the
+// evaluated radius is non-positive -- a degenerate row is not a bound, and
+// r_max^2 is the value the candidate sets were built on.
+__device__ float ConvexCell::site_weight_along(int idx, float dx, float dy,
+                                               float dz) const {
+  const float w0 = pts_weights[idx];
+  if (sh_stride <= 0 || pts_sh == nullptr || pts_shl == nullptr ||
+      pts_shnrm == nullptr)
+    return w0;
+  const int L = pts_shl[idx];
+  if (L <= 0) return w0;
+  const float len = sqrtf(dx * dx + dy * dy + dz * dz);
+  if (!(len > 0.0f)) return w0;
+  const float inv = 1.0f / len;
+  const float uz = fminf(1.0f, fmaxf(-1.0f, dz * inv));
+  const float th = acosf(uz);
+  const float ph = atan2f(dy * inv, dx * inv);
+  // _MAX_SH_D_ bounds L: (L+1)^2 coefficients live in a per-thread register
+  // array, so the band cap is a compile-time size, not a runtime allocation.
+  float Y[_MAX_SH_D_];
+  const int D = (L + 1) * (L + 1);
+  if (D > _MAX_SH_D_) return w0;
+  for (int k = 0; k < D; ++k) Y[k] = 0.0f;
+  devRealSH_cc(L, th, ph, pts_shnrm, Y);
+  const float* c = pts_sh + (size_t)idx * sh_stride;
+  float rad = 0.0f;
+  for (int k = 0; k < D && k < sh_stride; ++k) rad += c[k] * Y[k];
+  if (!(rad > 0.0f)) return w0;
+  return rad * rad;
+}
+
 __device__ float4 ConvexCell::point_from_index(int idx) {
   if (pts_pitch)
     return {pts[idx], pts[idx + pts_pitch], pts[idx + (pts_pitch << 1)],
@@ -571,7 +674,16 @@ __device__ int ConvexCell::new_plane(int seed_id) {
   float4 dir = minus4(voro_seed, B);  // normal point to voro_seed
   float4 ave2 = plus4(voro_seed, B);
   // we add weights for power diagram
-  float dot = dot3(ave2, dir) + (B.w - voro_seed.w);  // ninwang: should be + !!
+  // MSD_SPH_ANISO: the pair weights become DIRECTIONAL -- site A is evaluated
+  // along A->B and site B along B->A, so both are functions of the pair alone.
+  // With sh_stride == 0 these return the stored scalars and the expression is
+  // the original one exactly. (dir points B->A, so A->B is -dir.)
+  float wA = voro_seed.w, wB = B.w;
+  if (sh_stride > 0) {
+    wA = site_weight_along(voro_id, -dir.x, -dir.y, -dir.z);
+    wB = site_weight_along(seed_id, dir.x, dir.y, dir.z);
+  }
+  float dot = dot3(ave2, dir) + (wB - wA);  // ninwang: should be + !!
   // if (voro_id == 5 && (seed_id == 19 || seed_id == 29) && tet_id == 166) {
   //   float d = -dot / 2.f;
   //   printf(
@@ -1174,7 +1286,8 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
     const int* f_ids, const int* tet_knn_csr, const int* slot2tet,
     const int n_slots, Status* gpu_stat, VoronoiCell* voronoi_cells,
     ConvexCellTransfer* convex_cells_dev, float* cell_bary_sum,
-    const size_t cell_bary_sum_pitch, float* cell_vol) {
+    const size_t cell_bary_sum_pitch, float* cell_vol, const float* site_sh,
+    const int* site_shl, const float* site_shnrm, const int sh_stride) {
   bool is_debug = false;
   FOR(i, n_vert) { assert(v_adjs[i] > 0); }
 
@@ -1216,7 +1329,7 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
   ConvexCell cc(seed, site, site_pitch, site_weights, site_flags,
                 &(gpu_stat[thread]), tid, vert, n_vert, vert_pitch, idx,
                 idx_pitch, v_adjs, e_adj_offsets, e_adj_neighbors, e_adj_vals,
-                f_adjs, f_ids);
+                f_adjs, f_ids, site_sh, site_shl, site_shnrm, sh_stride);
 
   if (is_debug) {
     printf("[clipped] processing tid: %d, seed: %d\n", tid, seed);
