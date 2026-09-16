@@ -2,6 +2,9 @@
 
 #include <assert.h>
 
+#include <cmath>    // std::fabs, std::isfinite  (MSD_RPD_DEGEN_FILTER)
+#include <cstdlib>  // std::getenv
+
 void ConvexCellHost::print_info() const {
   printf(
       "Cell of id: %d, voro_id: %d, sq_radius: %f, tet_id: %d, nb_v: "
@@ -105,24 +108,88 @@ void ConvexCellHost::reload_active() {
   is_active_updated = true;
 }
 
+// MSD_RPD_DEGEN_FILTER (default ON) -- static filtered predicate for "are these
+// three clipping planes a PENCIL", i.e. is the perspective divide in
+// compute_vertex_coordinates a divide by zero.
+//
+// MEASURED 2026-09-16 on 15_tray_thin (site 2452 / tet 34235, dual triangle
+// (6,5,4)): the three plane normals were
+//     n4 = ( 7.618042, -20.842773,  2.476908)
+//     n5 = ( 0.000000, -20.842773,  0.000000)
+//     n6 = ( 7.618042,   0.000000,  2.476908)
+// with n4 = n5 + n6 EXACTLY, so det = 0 exactly (fp32 0.0, rational 0, fp64
+// -7e-14 of pure rounding noise). Three planes in a pencil have no finite
+// common point: the homogeneous vertex is at infinity and the divide yields
+// (-nan, -nan, -inf). The normals are centre-difference vectors, so this says
+// the four sphere centres are COPLANAR -- generic on a plate, where the medial
+// spheres lie on a sheet, which is why one thin tray produced ~40k of these.
+//
+// ⚠ MORE PRECISION MAKES THIS WORSE. In fp32 the determinant underflows to
+// exactly 0.0 and the isnan guard fires. In fp64 it is -7e-14, the divide
+// yields a FINITE coordinate of magnitude ~1e14, and the guard never sees it.
+// So the test has to be a relative-magnitude filter, not a precision upgrade.
+//
+// The bound is the standard static filter: |det| <= eps * (sum of the absolute
+// values of its six product terms) means the sign is not decidable in fp32.
+static bool degenerate_plane_triple(const cfloat4& p1, const cfloat4& p2,
+                                    const cfloat4& p3, float& det_out) {
+  const float d = cdet3x3(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
+  det_out = d;
+  const float scale = std::fabs(p1.x * p2.y * p3.z) + std::fabs(p1.x * p2.z * p3.y) +
+                      std::fabs(p1.y * p2.x * p3.z) + std::fabs(p1.y * p2.z * p3.x) +
+                      std::fabs(p1.z * p2.x * p3.y) + std::fabs(p1.z * p2.y * p3.x);
+  // 8 ulp of fp32 against the term magnitude; at scale == 0 every term is zero
+  // and the triple is degenerate by definition.
+  return !(std::fabs(d) > 8.0f * 1.1920929e-7f * scale);
+}
+
 void ConvexCellHost::reload_pc_explicit() {
+  static const bool degen_filter = [] {
+    const char* v = std::getenv("MSD_RPD_DEGEN_FILTER");
+    return !v || !*v || !(v[0] == '0');
+  }();
+  static const bool degen_verbose = [] {
+    const char* v = std::getenv("MSD_RPD_DEGEN_VERBOSE");
+    return v && *v && v[0] != '0';
+  }();
   pc_points.clear();
+  n_degenerate_v = 0;
   FOR(i, nb_v) {
-    cfloat4 voro_vertex =
-        compute_vertex_coordinates(cmake_uchar3(ver_trans(i)));
-    // ninwang: TODO check this
-    if (std::isnan(voro_vertex.x) || std::isnan(voro_vertex.y) ||
-        std::isnan(voro_vertex.z)) {
-      printf(
-          "ERROR: cell of site %d tet %d has vertex is NaN (%f, %f, %f), dual "
-          "triangle (%d, %d, %d)\n",
-          voro_id, tet_id, voro_vertex.x, voro_vertex.y, voro_vertex.z,
-          ver_trans(i).x, ver_trans(i).y, ver_trans(i).z);
+    const cuchar3 t = cmake_uchar3(ver_trans(i));
+    if (degen_filter) {
+      float det = 0.f;
+      if (degenerate_plane_triple(clip_trans_const(t.x), clip_trans_const(t.y),
+                                  clip_trans_const(t.z), det)) {
+        // The vertex is at infinity. Mark the cell, COUNT it, and push a
+        // placeholder so `pc_points` stays index-parallel with `nb_v` -- the
+        // old code `return`ed here, leaving a SHORT array, and every consumer
+        // that indexes pc_points by vertex id then reads the wrong point or
+        // runs off the end (the [FixFacet] map::at abort).
+        ++n_degenerate_v;
+        is_vertex_null = true;
+        if (degen_verbose)
+          printf("DEGEN: site %d tet %d dual triangle (%d,%d,%d) det %.6g "
+                 "-- plane pencil, vertex at infinity\n",
+                 voro_id, tet_id, t.x, t.y, t.z, det);
+        pc_points.push_back(cmake_float3(0.f, 0.f, 0.f));
+        continue;
+      }
+    }
+    cfloat4 voro_vertex = compute_vertex_coordinates(t);
+    // Non-finite covers inf as well as NaN: with the filter off, or if a
+    // near-degenerate triple slips the bound, the divide can produce a finite
+    // -inf that `isnan` alone lets through.
+    if (!std::isfinite(voro_vertex.x) || !std::isfinite(voro_vertex.y) ||
+        !std::isfinite(voro_vertex.z)) {
+      ++n_degenerate_v;
       is_vertex_null = true;
-      print_info();
-      return;
-      // assert(false);
-      // continue;
+      if (degen_verbose)
+        printf("ERROR: cell of site %d tet %d has vertex NON-FINITE (%f, %f, "
+               "%f), dual triangle (%d, %d, %d)\n",
+               voro_id, tet_id, voro_vertex.x, voro_vertex.y, voro_vertex.z,
+               t.x, t.y, t.z);
+      pc_points.push_back(cmake_float3(0.f, 0.f, 0.f));
+      continue;
     }
     pc_points.push_back(
         cmake_float3(voro_vertex.x, voro_vertex.y, voro_vertex.z));

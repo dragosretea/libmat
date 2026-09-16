@@ -499,9 +499,23 @@ void fix_topo_facet_cc_euler(
     if (!msphere_neigh.fcc_is_to_fix(sphere_id)) {
       printf("[FixFacet] neigh_id %d not contain faceCC of sphere_id %d\n",
              neigh_id, sphere_id);
-      printf("[FixFacet] [%d,%d] has FacetCC [%d,%d] \n", sphere_id, neigh_id,
-             facet_cc_cells.at(neigh_id).size(),
-             msphere_neigh.pcell.facet_cc_cells.at(sphere_id).size());
+      // WARNING: THE DIAGNOSTIC USED TO THROW. This branch is entered precisely
+      // BECAUSE `msphere_neigh.pcell.facet_cc_cells` has no entry for
+      // `sphere_id`, and the printf then called `.at(sphere_id)` on that same
+      // map -- `std::map::at` raises std::out_of_range, so the process died
+      // with `[ups][FATAL] map::at` and the `continue` below (the code's own
+      // intended handling, "we skip it since dunno what to do") was
+      // unreachable. Measured 2026-09-16 on 15_tray_thin, which reaches this
+      // branch as soon as the topology checker is actually live.
+      {
+        const auto it_a = facet_cc_cells.find(neigh_id);
+        const auto it_b = msphere_neigh.pcell.facet_cc_cells.find(sphere_id);
+        printf("[FixFacet] [%d,%d] has FacetCC [%s,%s] \n", sphere_id, neigh_id,
+               it_a == facet_cc_cells.end()
+                   ? "absent" : std::to_string(it_a->second.size()).c_str(),
+               it_b == msphere_neigh.pcell.facet_cc_cells.end()
+                   ? "absent" : std::to_string(it_b->second.size()).c_str());
+      }
       // assert(false);
       // seems fix_topo_is_delete_or_skip() cannot fix this case
       // we skip it since dunno what to do

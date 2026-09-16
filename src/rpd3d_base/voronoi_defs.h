@@ -64,6 +64,10 @@ struct ConvexCellHost {
   void reload_pc_explicit();
   // some vertices may be null
   bool is_vertex_null = false;
+  // MSD_RPD_DEGEN_FILTER: how many of this cell's vertices were plane pencils
+  // (vertex at infinity). `is_vertex_null` only says "at least one"; the count
+  // is what makes the degeneracy rate measurable per part.
+  int n_degenerate_v = 0;
 
   // debug
   void print_cell_detail_euler() const;
