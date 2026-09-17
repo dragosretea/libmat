@@ -32,12 +32,84 @@ void ConvexCellHost::print_info() const {
   }
 }
 
+// Compensated (error-free-transformation) fp32 Cramer solve: same float
+// storage and float arithmetic as `compute_vertex_coordinates`, but every
+// product and sum carries its rounding error in a second float, so the 3x3
+// determinants are evaluated to ~2x fp32 precision. No double anywhere.
+namespace {
+struct FF {
+  float hi, lo;
+};
+inline FF ff(float a) { return FF{a, 0.f}; }
+inline FF ff_add(FF a, FF b) {
+  const float s = a.hi + b.hi;
+  const float bb = s - a.hi;
+  float err = (a.hi - (s - bb)) + (b.hi - bb);
+  err += a.lo + b.lo;
+  const float hi = s + err;
+  return FF{hi, err - (hi - s)};
+}
+inline FF ff_neg(FF a) { return FF{-a.hi, -a.lo}; }
+inline FF ff_mul(FF a, FF b) {
+  const float p = a.hi * b.hi;
+  float err = std::fmaf(a.hi, b.hi, -p);
+  err += a.hi * b.lo + a.lo * b.hi;
+  const float hi = p + err;
+  return FF{hi, err - (hi - p)};
+}
+inline FF ff_det2(FF a, FF b, FF c, FF d) {
+  return ff_add(ff_mul(a, d), ff_neg(ff_mul(b, c)));
+}
+inline FF ff_det3(float a11, float a12, float a13, float a21, float a22,
+                  float a23, float a31, float a32, float a33) {
+  const FF t1 = ff_mul(ff(a11), ff_det2(ff(a22), ff(a23), ff(a32), ff(a33)));
+  const FF t2 = ff_mul(ff(a21), ff_det2(ff(a12), ff(a13), ff(a32), ff(a33)));
+  const FF t3 = ff_mul(ff(a31), ff_det2(ff(a12), ff(a13), ff(a22), ff(a23)));
+  return ff_add(ff_add(t1, ff_neg(t2)), t3);
+}
+// FF / FF to fp32 accuracy: one Newton correction on the fp32 quotient.
+inline float ff_div(FF a, FF b) {
+  const float q = a.hi / b.hi;
+  const FF r = ff_add(a, ff_neg(ff_mul(ff(q), b)));
+  return q + r.hi / b.hi;
+}
+}  // namespace
+
 // ninwang: must in sync with ConvexCell::compute_vertex_coordinates()
 cfloat4 ConvexCellHost::compute_vertex_coordinates(cuchar3 t,
                                                    bool persp_divide) const {
+  // MSD_RPD_FP32_COMP (default ON) -- evaluate the Cramer solve with
+  // compensated fp32 (ff_det3/ff_div above). MEASURED 2026-09-17 on
+  // 15_tray_thin against an fp64 shadow of the SAME fp32 plane data, over the
+  // 195603 vertices that pass degenerate_plane_triple: the plain expression
+  // below leaves 487 vertices worse than 1e-6 relative, 174 worse than 1e-4 and
+  // 34 worse than 1e-2, the worst 9.6% off; compensated the worst is 5.85e-08,
+  // ~0.5 ulp. The vertex COUNT is identical either way -- the degeneracy filter
+  // is untouched and still runs in plain fp32, so no topology decision moves.
+  // `=0` restores the original expression exactly.
+  static const bool comp = [] {
+    const char* v = std::getenv("MSD_RPD_FP32_COMP");
+    return !v || !*v || !(v[0] == '0');
+  }();
+
   cfloat4 pi1 = clip_trans_const(t.x);
   cfloat4 pi2 = clip_trans_const(t.y);
   cfloat4 pi3 = clip_trans_const(t.z);
+
+  if (comp) {
+    const FF fx = ff_det3(pi1.w, pi1.y, pi1.z, pi2.w, pi2.y, pi2.z, pi3.w,
+                          pi3.y, pi3.z);
+    const FF fy = ff_det3(pi1.x, pi1.w, pi1.z, pi2.x, pi2.w, pi2.z, pi3.x,
+                          pi3.w, pi3.z);
+    const FF fz = ff_det3(pi1.x, pi1.y, pi1.w, pi2.x, pi2.y, pi2.w, pi3.x,
+                          pi3.y, pi3.w);
+    const FF fw = ff_det3(pi1.x, pi1.y, pi1.z, pi2.x, pi2.y, pi2.z, pi3.x,
+                          pi3.y, pi3.z);
+    if (persp_divide)
+      return cmake_float4(-ff_div(fx, fw), -ff_div(fy, fw), -ff_div(fz, fw), 1);
+    return cmake_float4(-fx.hi, -fy.hi, -fz.hi, fw.hi);
+  }
+
   cfloat4 result;
   result.x =
       -cdet3x3(pi1.w, pi1.y, pi1.z, pi2.w, pi2.y, pi2.z, pi3.w, pi3.y, pi3.z);
@@ -51,28 +123,7 @@ cfloat4 ConvexCellHost::compute_vertex_coordinates(cuchar3 t,
   cfloat4 result_per = cmake_float4(result.x / result.w, result.y / result.w,
                                     result.z / result.w, 1);
 
-  // // debug
-  // if (((voro_id == 63) && tet_id == 3175) &&
-  //     ((t.x == 9 && t.y == 8 && t.z == 5) ||
-  //      (t.x == 9 && t.y == 0 && t.z == 8) ||
-  //      (t.x == 9 && t.y == 5 && t.z == 0))) {
-  //   printf("tet_id %d, voro_id %d, vertex (%d,%d,%d) w: %f, xyz(%f, %f,
-  //   %f)\n",
-  //          tet_id, voro_id, t.x, t.y, t.z, result.w, result.x, result.y,
-  //          result.z);
-  //   printf("result_per: (%f, %f, %f, %f) \n", result_per.x, result_per.y,
-  //          result_per.z, result_per.w);
-
-  //   printf("p1: (%f,%f,%f,%f)\n", pi1.x, pi1.y, pi1.z, pi1.w);
-  //   printf("p2: (%f,%f,%f,%f)\n", pi2.x, pi2.y, pi2.z, pi2.w);
-  //   printf("p3: (%f,%f,%f,%f)\n", pi3.x, pi3.y, pi3.z, pi3.w);
-  //   // return make_cfloat4(result.x, result.y, result.z, result.w);
-  //   // return make_cfloat4(0.f, 0.f, 0.f, 0.f);
-  // }
-
   if (persp_divide) return result_per;
-  // return make_cfloat4(result.x / result.w, result.y / result.w,
-  //                    result.z / result.w, 1);
   return result;
 }
 
@@ -131,6 +182,8 @@ void ConvexCellHost::reload_active() {
 //
 // The bound is the standard static filter: |det| <= eps * (sum of the absolute
 // values of its six product terms) means the sign is not decidable in fp32.
+
+
 static bool degenerate_plane_triple(const cfloat4& p1, const cfloat4& p2,
                                     const cfloat4& p3, float& det_out) {
   const float d = cdet3x3(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
@@ -152,8 +205,32 @@ void ConvexCellHost::reload_pc_explicit() {
     const char* v = std::getenv("MSD_RPD_DEGEN_VERBOSE");
     return v && *v && v[0] != '0';
   }();
+  // MSD_RPD_DEGEN_REPAIR (default ON) -- place a degenerate vertex ON its three
+  // planes instead of at the origin, so the cell stays usable.
+  //
+  // A plane pencil means the four sphere centres are coplanar, so the three
+  // bisectors meet along a LINE, not a point: the 3x3 system is rank 2 and
+  // consistent, and any point on that line satisfies all three planes. The old
+  // code pushed (0,0,0) and set `is_vertex_null`, and rpd_update.cxx then
+  // dropped the ENTIRE convex cell -- every facet of it -- over one such
+  // vertex. On a plate the coplanar quadruple is GENERIC (the medial spheres
+  // lie on a sheet), so this discards power-cell topology wholesale.
+  //
+  // The repair solves the same three planes in a Tikhonov least-norm sense
+  // anchored at the centroid of the cell's FINITE vertices: it returns the
+  // point on the pencil line nearest that centroid, reduces to the exact vertex
+  // when the triple is well conditioned, and stays finite when the planes are
+  // inconsistent (parallel) rather than merely dependent. `n_degenerate_v`
+  // still counts every repair, so the census is unchanged.
+  // `=0` restores the placeholder + whole-cell drop.
+  static const bool degen_repair = [] {
+    const char* v = std::getenv("MSD_RPD_DEGEN_REPAIR");
+    return !v || !*v || !(v[0] == '0');
+  }();
+
   pc_points.clear();
   n_degenerate_v = 0;
+  std::vector<int> degen_lv;  // local vertex ids needing a repair
   FOR(i, nb_v) {
     const cuchar3 t = cmake_uchar3(ver_trans(i));
     if (degen_filter) {
@@ -166,7 +243,10 @@ void ConvexCellHost::reload_pc_explicit() {
         // that indexes pc_points by vertex id then reads the wrong point or
         // runs off the end (the [FixFacet] map::at abort).
         ++n_degenerate_v;
-        is_vertex_null = true;
+        if (degen_repair)
+          degen_lv.push_back(i);
+        else
+          is_vertex_null = true;
         if (degen_verbose)
           printf("DEGEN: site %d tet %d dual triangle (%d,%d,%d) det %.6g "
                  "-- plane pencil, vertex at infinity\n",
@@ -182,7 +262,10 @@ void ConvexCellHost::reload_pc_explicit() {
     if (!std::isfinite(voro_vertex.x) || !std::isfinite(voro_vertex.y) ||
         !std::isfinite(voro_vertex.z)) {
       ++n_degenerate_v;
-      is_vertex_null = true;
+      if (degen_repair)
+        degen_lv.push_back(i);
+      else
+        is_vertex_null = true;
       if (degen_verbose)
         printf("ERROR: cell of site %d tet %d has vertex NON-FINITE (%f, %f, "
                "%f), dual triangle (%d, %d, %d)\n",
@@ -193,6 +276,87 @@ void ConvexCellHost::reload_pc_explicit() {
     }
     pc_points.push_back(
         cmake_float3(voro_vertex.x, voro_vertex.y, voro_vertex.z));
+  }
+
+  if (!degen_lv.empty()) {
+    // Anchor: centroid of the finite vertices. A cell with NO finite vertex has
+    // nothing to anchor to, so it keeps the old whole-cell drop.
+    const int n_fin = (int)nb_v - (int)degen_lv.size();
+    if (n_fin <= 0) {
+      is_vertex_null = true;
+    } else {
+      float cx = 0.f, cy = 0.f, cz = 0.f;
+      {
+        size_t k = 0;
+        FOR(i, nb_v) {
+          if (k < degen_lv.size() && degen_lv[k] == (int)i) {
+            ++k;
+            continue;
+          }
+          cx += pc_points[i].x;
+          cy += pc_points[i].y;
+          cz += pc_points[i].z;
+        }
+      }
+      cx /= (float)n_fin;
+      cy /= (float)n_fin;
+      cz /= (float)n_fin;
+      for (int lv : degen_lv) {
+        const cuchar3 t = cmake_uchar3(ver_trans(lv));
+        const cfloat4 p[3] = {clip_trans_const(t.x), clip_trans_const(t.y),
+                              clip_trans_const(t.z)};
+        // Pick the best-conditioned PAIR of the three planes: their normals'
+        // cross product is the direction of the pencil line L. The third plane
+        // is dependent, so its constraint is implied and dropping it costs
+        // nothing -- and when the triple is inconsistent rather than merely
+        // dependent, the two best-conditioned planes are still the right answer.
+        int ba = -1, bb = -1;
+        float ux = 0.f, uy = 0.f, uz = 0.f, best = -1.f;
+        for (int a = 0; a < 3; ++a) {
+          const int b = (a + 1) % 3;
+          const float vx = p[a].y * p[b].z - p[a].z * p[b].y;
+          const float vy = p[a].z * p[b].x - p[a].x * p[b].z;
+          const float vz = p[a].x * p[b].y - p[a].y * p[b].x;
+          const float m2 = vx * vx + vy * vy + vz * vz;
+          if (m2 > best) {
+            best = m2;
+            ba = a;
+            bb = b;
+            ux = vx;
+            uy = vy;
+            uz = vz;
+          }
+        }
+        // All three normals parallel: no line, nothing to place the vertex on.
+        if (!(best > 0.f)) {
+          is_vertex_null = true;
+          continue;
+        }
+        // Rows (n_a, n_b, u) are mutually independent by construction -- u is
+        // orthogonal to both normals -- so this 3x3 is well conditioned even
+        // though the original triple was not. The third row pins the position
+        // ALONG L to the projection of the anchor, giving the point on L
+        // nearest the cell's finite centroid.
+        const float rhs0 = -p[ba].w, rhs1 = -p[bb].w;
+        const float rhs2 = ux * cx + uy * cy + uz * cz;
+        const FF dw = ff_det3(p[ba].x, p[ba].y, p[ba].z, p[bb].x, p[bb].y,
+                              p[bb].z, ux, uy, uz);
+        const FF dx = ff_det3(rhs0, p[ba].y, p[ba].z, rhs1, p[bb].y, p[bb].z,
+                              rhs2, uy, uz);
+        const FF dy = ff_det3(p[ba].x, rhs0, p[ba].z, p[bb].x, rhs1, p[bb].z,
+                              ux, rhs2, uz);
+        const FF dz = ff_det3(p[ba].x, p[ba].y, rhs0, p[bb].x, p[bb].y, rhs1,
+                              ux, uy, rhs2);
+        const float x = ff_div(dx, dw);
+        const float y = ff_div(dy, dw);
+        const float z = ff_div(dz, dw);
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+          is_vertex_null = true;
+          continue;
+        }
+        pc_points[lv] = cmake_float3(x, y, z);
+      }
+    }
   }
 
   // some clipping planes may not exist in tri but

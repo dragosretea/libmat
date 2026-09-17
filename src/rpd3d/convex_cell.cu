@@ -260,7 +260,14 @@ __device__ bool ConvexCell::is_security_radius_reached(float4 last_neig,
   // line (voro_seed, last_neig)
   float4 diff = minus4(voro_seed, last_neig);
   float r2_diff = voro_seed.w - last_neig.w;  // weight is already r^2
-  float w = (dot3(diff, diff) - r2_diff) / (2 * dot3(diff, diff));
+  const float sep2 = dot3(diff, diff);
+  // Coincident sites have no bisector, so there is no 'halfplane point' to
+  // measure against. The divide below would be 0/0; the NaN then falls through
+  // `d2 > 4 * v_dist` as false, which happens to be the conservative answer
+  // (keep clipping) -- state it instead of relying on NaN comparison order,
+  // which --use_fast_math is free to rearrange.
+  if (!(sep2 > 0.f)) return false;
+  float w = (sep2 - r2_diff) / (2 * sep2);
   float4 p_halfplane = plus4(mul4(w, diff), last_neig);  // don't care about w
   float4 voro_p_diff = minus4(p_halfplane, voro_seed);   // don't care about w
   float d2 = dot3(voro_p_diff, voro_p_diff);
@@ -323,6 +330,71 @@ __device__ bool ConvexCell::is_vertex_perturb(uchar3 v) {
   return false;
 }
 
+// Compensated fp32 (error-free transformations), mirroring the host helpers in
+// voronoi_defs.cxx so the two compute_vertex_coordinates() stay in sync.
+//
+// WARNING: this TU is built with --use_fast_math (src/rpd3d/CMakeLists.txt),
+// which makes plain `/` approximate and lets nvcc contract and reassociate. The
+// error terms below are only exact under round-to-nearest, so every step uses
+// the __*_rn intrinsics explicitly -- do NOT "simplify" them back to operators.
+struct FF32 {
+  float hi, lo;
+};
+__device__ inline FF32 ff32(float a) {
+  FF32 r;
+  r.hi = a;
+  r.lo = 0.f;
+  return r;
+}
+__device__ inline FF32 ff32_add(FF32 a, FF32 b) {
+  const float s = __fadd_rn(a.hi, b.hi);
+  const float bb = __fsub_rn(s, a.hi);
+  float err =
+      __fadd_rn(__fsub_rn(a.hi, __fsub_rn(s, bb)), __fsub_rn(b.hi, bb));
+  err = __fadd_rn(err, __fadd_rn(a.lo, b.lo));
+  const float hi = __fadd_rn(s, err);
+  FF32 r;
+  r.hi = hi;
+  r.lo = __fsub_rn(err, __fsub_rn(hi, s));
+  return r;
+}
+__device__ inline FF32 ff32_neg(FF32 a) {
+  FF32 r;
+  r.hi = -a.hi;
+  r.lo = -a.lo;
+  return r;
+}
+__device__ inline FF32 ff32_mul(FF32 a, FF32 b) {
+  const float p = __fmul_rn(a.hi, b.hi);
+  float err = __fmaf_rn(a.hi, b.hi, -p);
+  err = __fadd_rn(err,
+                  __fadd_rn(__fmul_rn(a.hi, b.lo), __fmul_rn(a.lo, b.hi)));
+  const float hi = __fadd_rn(p, err);
+  FF32 r;
+  r.hi = hi;
+  r.lo = __fsub_rn(err, __fsub_rn(hi, p));
+  return r;
+}
+__device__ inline FF32 ff32_det2(FF32 a, FF32 b, FF32 c, FF32 d) {
+  return ff32_add(ff32_mul(a, d), ff32_neg(ff32_mul(b, c)));
+}
+__device__ inline FF32 ff32_det3(float a11, float a12, float a13, float a21,
+                                 float a22, float a23, float a31, float a32,
+                                 float a33) {
+  const FF32 t1 =
+      ff32_mul(ff32(a11), ff32_det2(ff32(a22), ff32(a23), ff32(a32), ff32(a33)));
+  const FF32 t2 =
+      ff32_mul(ff32(a21), ff32_det2(ff32(a12), ff32(a13), ff32(a32), ff32(a33)));
+  const FF32 t3 =
+      ff32_mul(ff32(a31), ff32_det2(ff32(a12), ff32(a13), ff32(a22), ff32(a23)));
+  return ff32_add(ff32_add(t1, ff32_neg(t2)), t3);
+}
+__device__ inline float ff32_div(FF32 a, FF32 b) {
+  const float q = __fdiv_rn(a.hi, b.hi);
+  const FF32 r = ff32_add(a, ff32_neg(ff32_mul(ff32(q), b)));
+  return __fadd_rn(q, __fdiv_rn(r.hi, b.hi));
+}
+
 // ninwang: must in sync with ConvexCellHost::compute_vertex_coordinates()
 __device__ float4
 ConvexCell::compute_vertex_coordinates(uchar3 v, bool persp_divide) const {
@@ -330,14 +402,18 @@ ConvexCell::compute_vertex_coordinates(uchar3 v, bool persp_divide) const {
   float4 pi2 = clip4(v.y);
   float4 pi3 = clip4(v.z);
   float4 result;
-  result.x =
-      -det3x3(pi1.w, pi1.y, pi1.z, pi2.w, pi2.y, pi2.z, pi3.w, pi3.y, pi3.z);
-  result.y =
-      -det3x3(pi1.x, pi1.w, pi1.z, pi2.x, pi2.w, pi2.z, pi3.x, pi3.w, pi3.z);
-  result.z =
-      -det3x3(pi1.x, pi1.y, pi1.w, pi2.x, pi2.y, pi2.w, pi3.x, pi3.y, pi3.w);
-  result.w =
-      det3x3(pi1.x, pi1.y, pi1.z, pi2.x, pi2.y, pi2.z, pi3.x, pi3.y, pi3.z);
+  const FF32 fx = ff32_det3(pi1.w, pi1.y, pi1.z, pi2.w, pi2.y, pi2.z, pi3.w,
+                            pi3.y, pi3.z);
+  const FF32 fy = ff32_det3(pi1.x, pi1.w, pi1.z, pi2.x, pi2.w, pi2.z, pi3.x,
+                            pi3.w, pi3.z);
+  const FF32 fz = ff32_det3(pi1.x, pi1.y, pi1.w, pi2.x, pi2.y, pi2.w, pi3.x,
+                            pi3.y, pi3.w);
+  const FF32 fw = ff32_det3(pi1.x, pi1.y, pi1.z, pi2.x, pi2.y, pi2.z, pi3.x,
+                            pi3.y, pi3.z);
+  result.x = -fx.hi;
+  result.y = -fy.hi;
+  result.z = -fz.hi;
+  result.w = fw.hi;
 
   // if (tet_id == 166 && voro_id == 5 && v.x == 5) {
   //   printf(
@@ -353,8 +429,8 @@ ConvexCell::compute_vertex_coordinates(uchar3 v, bool persp_divide) const {
   }
 
   if (persp_divide)
-    return make_float4(result.x / result.w, result.y / result.w,
-                       result.z / result.w, 1);
+    return make_float4(-ff32_div(fx, fw), -ff32_div(fy, fw), -ff32_div(fz, fw),
+                       1);
   return result;
 }
 
@@ -1442,11 +1518,14 @@ __global__ void clipped_voro_cell_test_GPU_param_tet(
     // ninwang: save cc
     copy(cc, convex_cells_dev[thread], thread);
 
-    // ninwang:
-    // the sum/vol may push the center far far away
-    // from the power cell
-    atomic_add_bary_and_volume(cc, seed, cell_bary_sum, cell_bary_sum_pitch,
-                               cell_vol);
+    // REMOVED 2026-09-17: atomic_add_bary_and_volume(). Its three outputs have
+    // no consumer -- `cell_bary_sum` fed only compute_new_site() (never
+    // launched), `cell_vol` is never copied D2H (voronoi.cu:727 returns
+    // site_cell_vol all-zero), and its `*cc.status = no_intersection` landed
+    // AFTER copy() had already snapshotted the status that flag_valid_cells
+    // reads. It cost nb_v*6 tet-volume evaluations plus four contended fp32
+    // atomics per cell, and the non-associative atomics were twice mistaken for
+    // a nondeterminism source. Removing it is bit-identical.
 
     // use random convex cell barycenter instead
     // choose_random_bary_and_volume(cc, seed, cell_bary_sum,
@@ -1471,7 +1550,6 @@ __global__ void clipped_voro_cell_test_GPU_param(
 
   clip_voro_cell_by_tet(cc, tid, vert, vert_pitch, idx, idx_pitch);
 
-  if (*cc.status != no_intersection)
-    atomic_add_bary_and_volume(cc, seed, cell_bary_sum, cell_bary_sum_pitch,
-                               cell_vol);
+  // REMOVED 2026-09-17: atomic_add_bary_and_volume(), see above. This kernel
+  // is itself never launched.
 }
